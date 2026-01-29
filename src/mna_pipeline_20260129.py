@@ -571,7 +571,7 @@ log(f"✅ Cell B Complete. Panel has {len(panel_clean)} rows.")
 # %%
 import csv
 
-def load_deals_robust(config, preloaded_df=None):
+def load_deals_robust(config, preloaded_df=None, tic_map=None):
     if preloaded_df is not None and not preloaded_df.empty:
         log(f"Using preloaded deals dataframe ({len(preloaded_df)} rows)...")
         df = preloaded_df.copy()
@@ -579,7 +579,9 @@ def load_deals_robust(config, preloaded_df=None):
         # Ensure date_announcement is mapped to ann_date if not already
         if "date_announcement" in df.columns and "ann_date" not in df.columns:
             df["ann_date"] = df["date_announcement"]
-            
+        elif "Announcement Date" in df.columns and "ann_date" not in df.columns:
+             df["ann_date"] = df["Announcement Date"]
+             
     else:
         # Fallback: Load from CSV
         csv_path = resolve_path(config["inputs"]["deals"])
@@ -600,36 +602,13 @@ def load_deals_robust(config, preloaded_df=None):
         log(f"Loading deals with separator='{sep}'...")
         df = pd.read_csv(csv_path, sep=sep, engine="python")
     
-    # If preloaded, we assume it's mostly good but just need final column selection
-    if preloaded_df is not None and not preloaded_df.empty:
-        # Just ensure CIK and Ann Date are present
-        if "cik" not in df.columns and "url" in df.columns:
-            df["cik"] = df["url"].astype(str).str.extract(r'/data/(\d{1,10})/')
-        
-        # Ensure ann_date
-        if "ann_date" not in df.columns:
-            if "date_announcement" in df.columns:
-                 df["ann_date"] = df["date_announcement"]
-            elif "Announcement Date" in df.columns:
-                 df["ann_date"] = df["Announcement Date"]
-                 
-        # Ensure deal value
-        if "_deal_value_num" not in df.columns:
-            # FactSet usually has "Transaction Value (MM)"
-            val_col = next((c for c in df.columns if "Transaction Value" in c), None)
-            if val_col:
-                df["_deal_value_num"] = pd.to_numeric(df[val_col], errors="coerce")
-                df["_deal_value_log"] = np.log1p(df["_deal_value_num"].fillna(0))
-            else:
-                 df["_deal_value_num"] = np.nan
-                 df["_deal_value_log"] = 0.0
-
-    else:
-        # CSV Path - Full Normalization Logic
+    # --- Common Normalization ---
+    
+    # Map Columns if not preloaded (or strictly check existence)
+    if preloaded_df is None:
         col_map = {c: c.lower().strip().replace(" ", "").replace("_", "") for c in df.columns}
         rev_map = {v: k for k, v in col_map.items()} # normalized -> original
         
-        # Rename known targets
         rename_dict = {}
         if "dateannouncement" in rev_map: rename_dict[rev_map["dateannouncement"]] = "ann_date"
         if "cik" in rev_map: rename_dict[rev_map["cik"]] = "cik"
@@ -656,19 +635,93 @@ def load_deals_robust(config, preloaded_df=None):
             df["_deal_value_num"] = np.nan
             df["_deal_value_log"] = 0.0
 
+    # --- Ticker Mapping (Crucial for FactSet) ---
+    # FactSet deals often lack CIK but have Target name/ticker
+    if tic_map is not None:
+        # Check if we have missing CIKs
+        if "cik" not in df.columns:
+            df["cik"] = np.nan
+        
+        # Check for potential ticker columns
+        # FactSet usually has 'Target' (Name) or 'Target Ticker'
+        # We'll valid candidates: 'Target Ticker', 'Symbol', 'Ticker'
+        tic_col = None
+        for cand in ["Target Ticker", "target ticker", "Symbol", "symbol", "Ticker", "ticker"]:
+            if cand in df.columns:
+                tic_col = cand
+                break
+        
+        # If no specific ticker col, tries 'Target' (Company Name) ??? 
+        # No, 'tic' map expects Tickers (e.g. AAPL). Company Names won't match.
+        # So strict check for Ticker col.
+        
+        if tic_col:
+            mask_missing = df["cik"].isna()
+            n_missing = mask_missing.sum()
+            if n_missing > 0:
+                log(f"Mapping {n_missing} missing CIKs using ticker col '{tic_col}'...")
+                # map expects upper case tickers usually
+                # ensuring string cleaning
+                clean_tics = df.loc[mask_missing, tic_col].astype(str).str.upper().str.strip()
+                df.loc[mask_missing, "cik"] = clean_tics.map(tic_map)
+                
+                n_filled = df.loc[mask_missing, "cik"].notna().sum()
+                log(f"  Filled {n_filled} CIKs.")
+
     # Common Cleanup
-    df["cik"] = pd.to_numeric(df["cik"], errors="coerce").astype("Int64")
-    df.dropna(subset=["cik"], inplace=True)
+    # Clean CIK
+    if "cik" in df.columns:
+        df["cik"] = pd.to_numeric(df["cik"], errors="coerce").astype("Int64")
+        initial_len = len(df)
+        df.dropna(subset=["cik"], inplace=True)
+        dropped = initial_len - len(df)
+        if dropped > 0:
+            log(f"[WARN] Dropped {dropped} deals due to missing/invalid CIK.")
+    else:
+        log("[ERROR] No CIK column found. Dropping ALL deals.")
+        return pd.DataFrame(columns=["cik", "ann_date", "_deal_value_num", "_deal_value_log"])
     
-    df["ann_date"] = pd.to_datetime(df["ann_date"], errors="coerce")
-    df.dropna(subset=["ann_date"], inplace=True)
+    # Clean Date
+    if "ann_date" in df.columns:
+        df["ann_date"] = pd.to_datetime(df["ann_date"], errors="coerce")
+        df.dropna(subset=["ann_date"], inplace=True)
     
+    # Clean Value
+    if "_deal_value_str" in df.columns:
+        df["_deal_value_num"] = pd.to_numeric(
+             df["_deal_value_str"].astype(str).str.replace(r"[^0-9.]", "", regex=True),
+             errors="coerce"
+        )
+        # Handle log
+        df["_deal_value_log"] = np.log1p(df["_deal_value_num"].fillna(0))
+        
+    elif "_deal_value_num" in df.columns:
+         df["_deal_value_log"] = np.log1p(df["_deal_value_num"].fillna(0))
+    else:
+        df["_deal_value_num"] = np.nan
+        df["_deal_value_log"] = 0.0
+        
     # Select final
     out = df[["cik", "ann_date", "_deal_value_num", "_deal_value_log"]].copy()
-    out = out.sort_values("ann_date").reset_index(drop=True)
+    if "ann_date" in out.columns:
+        out = out.sort_values("ann_date").reset_index(drop=True)
+        
     return out
 
-deals_df = load_deals_robust(CONFIG, preloaded_df=DEALS_DF)
+# Build Ticker -> CIK map from Compustat (panel_clean)
+# This allows us to link FactSet deals (which have Tickers) to CIKs
+TIC_MAP = {}
+if "tic" in panel_clean.columns and "cik" in panel_clean.columns:
+    # Drop rows without Ticker or CIK
+    valid_map = panel_clean[["tic", "cik"]].dropna()
+    # Normalize ticker (upper)
+    valid_map["tic"] = valid_map["tic"].astype(str).str.upper().str.strip()
+    valid_map["cik"] = valid_map["cik"].astype("Int64")
+    # multiple tickers might map to same CIK, just take last observed
+    TIC_MAP = valid_map.set_index("tic")["cik"].to_dict()
+    log(f"Generated Ticker-CIK map with {len(TIC_MAP)} entries.")
+
+deals_df = load_deals_robust(CONFIG, preloaded_df=DEALS_DF, tic_map=TIC_MAP)
 
 # Save
 deals_path = os.path.join(ARTIFACT_DIR, "deals.parquet")
@@ -978,11 +1031,12 @@ def dry_run_harness(df, target_col, n_trials=5, top_k=50):
 features_df["panel_q"] = features_df["datadate"].dt.to_period("Q")
 
 # Run Dry Run
-dry_res, stability_score = dry_run_harness(features_df, "label_deal_0_3m", n_trials=CONFIG["calibration"]["n_dryrun_trials"])
+dry_res, stability_score = dry_run_harness(labeled_panel, "label_deal_0_3m", n_trials=CONFIG["calibration"]["n_dryrun_trials"])
 
 # Save
-dry_path = os.path.join(ARTIFACT_DIR, "dryrun_trials.parquet")
-dry_res.to_parquet(dry_path)
+dry_path = os.path.join(ARTIFACT_DIR, "dry_run_results.json")
+with open(dry_path, "w") as f:
+    json.dump(dry_res.to_dict('records'), f, indent=4) # Convert DataFrame to list of dicts for JSON saving
 log(f"✅ Cell F Complete. Stability Score: {stability_score:.2f}")
 
 # %% [markdown]

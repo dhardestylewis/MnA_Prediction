@@ -84,9 +84,10 @@ CONFIG = {
         # Large files -> Google Drive only
         "fundq": "fundq_full.parquet",
         "funda": "funda_full.parquet",
-        # Smaller files -> GitHub repo preferred
-        "deals": "dma_corpus_metadata_with_factset_id.csv",
-        "factset_xls_dir": "All Factset Deals 2000 to Pres-20251028T201845Z-1-001/All Factset Deals 2000 to Pres"
+        # Smaller files -> GitHub repo preferred (new directory structure)
+        "deals": "data/deals/dma_corpus_metadata_with_factset_id.csv",
+        "factset_xls_dir": "data/deals/factset_xls",
+        "fundamentals_csv": "data/fundamentals/compustat_funda_2000on.csv"
     },
     "horizons_months": [3, 6, 9, 12, 15, 18, 21, 24],
     "safe_lag_days": 90,
@@ -279,7 +280,7 @@ def extend_fundamentals(config, save_extended=False):
     
     for data_type, parquet_key, csv_candidates in [
         ("quarterly", "fundq", []),  # No quarterly CSV currently available
-        ("annual", "funda", ["compustat_funda_2000on.csv"]),
+        ("annual", "funda", [config["inputs"].get("fundamentals_csv", "data/fundamentals/compustat_funda_2000on.csv")]),
     ]:
         parquet_file = config["inputs"][parquet_key]
         parquet_path = os.path.join(config["drive_dir"], parquet_file)

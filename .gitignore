@@ -1,0 +1,26 @@
+# Large Compustat parquet files (>100MB) - keep on Google Drive
+fundq_full.parquet
+funda_full.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Artifacts (generated during runs)
+mna_artifacts/

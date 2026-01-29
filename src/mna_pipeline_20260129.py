@@ -605,20 +605,32 @@ def load_deals_robust(config, preloaded_df=None, tic_map=None):
     # --- Common Normalization ---
     
     # ALWAYS Normalize Cols (even for preloaded) to avoid case issues (CIK vs cik)
-    # This fixes data loss when preloaded df has 'CIK' but code expects 'cik'
     col_map = {c: c.lower().strip().replace(" ", "").replace("_", "") for c in df.columns}
     rev_map = {v: k for k, v in col_map.items()} # normalized -> original
     
     rename_dict = {}
-    if "dateannouncement" in rev_map: rename_dict[rev_map["dateannouncement"]] = "ann_date"
-    if "cik" in rev_map: rename_dict[rev_map["cik"]] = "cik"
+    
+    # Only rename to 'ann_date' if we don't already have it
+    has_ann_date = "ann_date" in col_map.values() or "dateannouncement" in col_map.values()
+    # Actually, check if target col exists in current df
+    target_exists = "ann_date" in df.columns
+    
+    if not target_exists:
+        if "dateannouncement" in rev_map: 
+             rename_dict[rev_map["dateannouncement"]] = "ann_date"
+        elif "announcementdate" in rev_map:
+             rename_dict[rev_map["announcementdate"]] = "ann_date"
+
+    if "cik" in rev_map and "cik" not in df.columns: 
+         rename_dict[rev_map["cik"]] = "cik"
     
     val_candidates = ["dealvalue", "transactionvalue"]
     val_orig = next((rev_map[v] for v in val_candidates if v in rev_map), None)
     if val_orig:
         rename_dict[val_orig] = "_deal_value_str"
     
-    df.rename(columns=rename_dict, inplace=True)
+    if rename_dict:
+        df.rename(columns=rename_dict, inplace=True)
 
     # CIK extraction (Regex from URL) - Fallback
     if "cik" not in df.columns and "url" in df.columns:
@@ -657,21 +669,16 @@ def load_deals_robust(config, preloaded_df=None, tic_map=None):
         return pd.DataFrame(columns=["cik", "ann_date", "_deal_value_num", "_deal_value_log"])
     
     if "ann_date" in df.columns:
+        # Check for duplicates (if multiple cols mapped to ann_date?)
+        # DataFrame constructor error happens if Series are passed with same name?
+        # No, pd.to_datetime on DataFrame with duplicate cols raises error.
+        # Ensure unique columns.
+        df = df.loc[:, ~df.columns.duplicated()]
+        
         df["ann_date"] = pd.to_datetime(df["ann_date"], errors="coerce")
         df.dropna(subset=["ann_date"], inplace=True)
     
     # Value Cleaning
-    if "_deal_value_str" in df.columns:
-        df["_deal_value_num"] = pd.to_numeric(
-             df["_deal_value_str"].astype(str).str.replace(r"[^0-9.]", "", regex=True),
-             errors="coerce"
-        )
-        df["_deal_value_log"] = np.log1p(df["_deal_value_num"].fillna(0))
-    elif "_deal_value_num" in df.columns:
-         df["_deal_value_log"] = np.log1p(df["_deal_value_num"].fillna(0))
-    else:
-        df["_deal_value_num"] = np.nan
-        df["_deal_value_log"] = 0.0
     if "_deal_value_str" in df.columns:
         df["_deal_value_num"] = pd.to_numeric(
              df["_deal_value_str"].astype(str).str.replace(r"[^0-9.]", "", regex=True),
@@ -712,6 +719,17 @@ deals_df = load_deals_robust(CONFIG, preloaded_df=DEALS_DF, tic_map=TIC_MAP)
 deals_path = os.path.join(ARTIFACT_DIR, "deals.parquet")
 deals_df.to_parquet(deals_path, index=False)
 log(f"✅ Cell C Complete. Loaded {len(deals_df)} deals. Saved to {deals_path}")
+
+# Print Year-to-Year Stats
+if not deals_df.empty and "ann_date" in deals_df.columns:
+    deal_years = deals_df["ann_date"].dt.year
+    year_counts = deal_years.value_counts().sort_index()
+    log("\n--- Final Deal Counts by Year ---")
+    log(year_counts.to_string())
+    
+    # Check post-2020 coverage
+    post_2020 = deal_years[deal_years > 2020].count()
+    log(f"Post-2020 Deals: {post_2020}")
 
 # %% [markdown]
 # # Cell D: Feature Engineering (Vectorized)

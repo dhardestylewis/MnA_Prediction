@@ -492,7 +492,7 @@ def load_and_prep_compustat(config):
         # Here we flag forward from first change to be safe (conservative).
         
         # Use has_change directly - simpler and avoids NA issues
-        df["_raw_change"] = has_change.astype(int)
+        df["_raw_change"] = has_change.fillna(False).astype(int)
         df["price_pit_risk_flag"] = df.groupby("gvkey")["_raw_change"].transform("cumsum").fillna(0).gt(0).astype(int)
         df.drop(columns=["_raw_change"], inplace=True)
     else:

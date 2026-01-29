@@ -117,11 +117,40 @@ def log(msg):
 # ================================================
 # CHECKPOINT / RESUME INFRASTRUCTURE
 # ================================================
-# Set RESUME_FROM_RUN_ID to resume from a previous run's checkpoints
-# Leave as None to start fresh
-RESUME_FROM_RUN_ID = None  # e.g., "20260129_222354" to resume
+# Set RESUME_FROM_RUN_ID to resume from a specific run, OR set AUTO_RESUME=True
+# to automatically pick the most recent run folder.
+RESUME_FROM_RUN_ID = None  # e.g., "20260129_222354"
+AUTO_RESUME = True        # If True, looks for latest folder in artifact_subfolder
+
+def find_latest_run_id(drive_base_dir, subfolder):
+    """Finds the most recent run ID folder."""
+    artifacts_path = os.path.join(drive_base_dir, subfolder)
+    if not os.path.exists(artifacts_path):
+        return None
+    
+    # List directories (run IDs are YYYYMMDD_HHMMSS)
+    runs = [d for d in os.listdir(artifacts_path) 
+            if os.path.isdir(os.path.join(artifacts_path, d)) and "_" in d]
+    
+    if not runs:
+        return None
+        
+    # Sort descending
+    runs.sort(reverse=True)
+    
+    # Filter out current run_id (we want the *previous* one)
+    # CONFIG["run_id"] is the current one we just created
+    prev_runs = [r for r in runs if r != CONFIG["run_id"]]
+    
+    return prev_runs[0] if prev_runs else None
 
 # Determine checkpoint directory
+if AUTO_RESUME and not RESUME_FROM_RUN_ID:
+    latest_run = find_latest_run_id(DRIVE_DIR, CONFIG["artifact_subfolder"])
+    if latest_run:
+        RESUME_FROM_RUN_ID = latest_run
+        log(f"🔎 Auto-detected latest run: {latest_run}")
+
 if RESUME_FROM_RUN_ID:
     CHECKPOINT_DIR = os.path.join(DRIVE_DIR, CONFIG["artifact_subfolder"], RESUME_FROM_RUN_ID)
     if os.path.exists(CHECKPOINT_DIR):

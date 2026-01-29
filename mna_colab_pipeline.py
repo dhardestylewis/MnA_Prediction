@@ -116,9 +116,232 @@ def log(msg):
 log("✅ Cell A Complete: Environment Setup.")
 
 # %% [markdown]
+# # Cell A2: Extend Deals Data (FactSet Batches 2000-2025)
+#
+# **Goal**: Load all 7 FactSet XLS batches and consolidate into a unified deals dataset.
+# This extends coverage beyond the 2020 cutoff in dma_corpus_metadata.
+# Schema is preserved to match existing pipeline expectations.
+
+# %%
+def load_extended_deals(config):
+    """
+    Load deals from two sources:
+    1. dma_corpus_metadata_with_factset_id.csv (2000-2020, richer text data)
+    2. FactSet XLS batches (2000-2025, for extending labels to 2021+)
+    
+    Returns a unified DataFrame with consistent schema.
+    """
+    import glob
+    
+    # --- Source 1: DMA Corpus (primary, has text excerpts) ---
+    dma_path = resolve_path(config["inputs"]["deals"], prefer_repo=True)
+    if dma_path and os.path.exists(dma_path):
+        log(f"Loading DMA corpus from {dma_path}...")
+        dma_df = pd.read_csv(dma_path, sep="|", low_memory=False)
+        dma_df["source"] = "dma_corpus"
+        log(f"  DMA corpus: {len(dma_df)} deals, years {dma_df['year'].min()}-{dma_df['year'].max()}")
+    else:
+        dma_df = pd.DataFrame()
+        log("[WARN] DMA corpus not found.")
+    
+    # --- Source 2: FactSet XLS Batches (for 2021+ extension) ---
+    xls_dir = resolve_path(config["inputs"]["factset_xls_dir"], prefer_repo=True)
+    xls_dfs = []
+    
+    if xls_dir and os.path.isdir(xls_dir):
+        log(f"Loading FactSet XLS batches from {xls_dir}...")
+        xls_files = sorted(glob.glob(os.path.join(xls_dir, "*.xls")))
+        
+        for xls_file in xls_files:
+            try:
+                batch_df = pd.read_excel(xls_file)
+                batch_df["source"] = os.path.basename(xls_file)
+                xls_dfs.append(batch_df)
+                log(f"  Loaded {os.path.basename(xls_file)}: {len(batch_df)} deals")
+            except Exception as e:
+                log(f"  [WARN] Failed to load {xls_file}: {e}")
+        
+        if xls_dfs:
+            factset_df = pd.concat(xls_dfs, ignore_index=True)
+            log(f"  Total FactSet XLS: {len(factset_df)} deals")
+        else:
+            factset_df = pd.DataFrame()
+    else:
+        factset_df = pd.DataFrame()
+        log("[WARN] FactSet XLS directory not found.")
+    
+    # --- Standardize FactSet XLS schema to match DMA corpus ---
+    if not factset_df.empty:
+        # Common column mapping (adjust based on actual XLS headers)
+        col_map = {
+            "Target Name": "target",
+            "Acquirer Name": "acquirer", 
+            "Announce Date": "date_announcement",
+            "Deal ID": "FactSet ID",
+        }
+        factset_df = factset_df.rename(columns={k: v for k, v in col_map.items() if k in factset_df.columns})
+        
+        # Extract year from announcement date
+        if "date_announcement" in factset_df.columns:
+            factset_df["date_announcement"] = pd.to_datetime(factset_df["date_announcement"], errors="coerce")
+            factset_df["year"] = factset_df["date_announcement"].dt.year
+    
+    # --- Merge: DMA corpus + NEW deals from FactSet (2021+) ---
+    if not dma_df.empty and not factset_df.empty:
+        # Only add FactSet deals that are AFTER DMA corpus coverage
+        dma_max_year = dma_df["year"].max()
+        new_deals = factset_df[factset_df["year"] > dma_max_year].copy()
+        log(f"  Extending with {len(new_deals)} new deals from {dma_max_year+1}+")
+        
+        # Align columns (keep only columns present in DMA corpus)
+        common_cols = [c for c in dma_df.columns if c in new_deals.columns]
+        if common_cols:
+            new_deals = new_deals[common_cols]
+            combined_df = pd.concat([dma_df, new_deals], ignore_index=True)
+        else:
+            log("[WARN] No common columns between DMA and FactSet. Using DMA only.")
+            combined_df = dma_df
+    elif not dma_df.empty:
+        combined_df = dma_df
+    elif not factset_df.empty:
+        combined_df = factset_df
+    else:
+        combined_df = pd.DataFrame()
+        log("[ERROR] No deals data loaded!")
+    
+    # --- Final summary ---
+    if not combined_df.empty:
+        log(f"✅ Extended deals dataset: {len(combined_df)} deals, years {combined_df['year'].min()}-{combined_df['year'].max()}")
+        
+        # Show company names if available
+        if "target" in combined_df.columns:
+            log(f"  Sample targets: {combined_df['target'].dropna().head(3).tolist()}")
+    
+    return combined_df
+
+# Load extended deals
+DEALS_DF = load_extended_deals(CONFIG)
+log("✅ Cell A2 Complete: Extended Deals Loaded.")
+
+# %% [markdown]
+# # Cell A3: Extend Fundamentals Data (Schema-Preserving)
+#
+# **Goal**: Extend `fundq_full.parquet` and `funda_full.parquet` using available CSV data.
+# The existing parquet schema is treated as ground truth - new data must match exactly.
+
+# %%
+def extend_fundamentals(config, save_extended=False):
+    """
+    Extend fundq/funda parquet files with newer data from CSVs.
+    Schema is determined by existing parquet - only matching columns are appended.
+    
+    Available extension sources:
+    - compustat_funda_2000on.csv (annual fundamentals)
+    
+    Args:
+        config: Pipeline config dict
+        save_extended: If True, saves extended parquet back to Drive
+    
+    Returns:
+        fundq_df, funda_df: Extended DataFrames (or originals if no extension possible)
+    """
+    results = {}
+    
+    for data_type, parquet_key, csv_candidates in [
+        ("quarterly", "fundq", []),  # No quarterly CSV currently available
+        ("annual", "funda", ["compustat_funda_2000on.csv"]),
+    ]:
+        parquet_file = config["inputs"][parquet_key]
+        parquet_path = os.path.join(config["drive_dir"], parquet_file)
+        
+        log(f"\n--- {data_type.upper()} Fundamentals ({parquet_key}) ---")
+        
+        # 1. Load existing parquet and extract schema
+        if os.path.exists(parquet_path):
+            existing_df = pd.read_parquet(parquet_path)
+            schema_cols = list(existing_df.columns)
+            schema_dtypes = existing_df.dtypes.to_dict()
+            
+            log(f"Loaded {parquet_file}: {len(existing_df)} rows")
+            log(f"Schema: {len(schema_cols)} columns")
+            log(f"Date range: {existing_df['datadate'].min()} to {existing_df['datadate'].max()}")
+            
+            # Show sample companies if available
+            if "conm" in existing_df.columns:
+                log(f"Sample companies: {existing_df['conm'].dropna().head(3).tolist()}")
+        else:
+            log(f"[WARN] {parquet_file} not found at {parquet_path}")
+            results[data_type] = pd.DataFrame()
+            continue
+        
+        # 2. Look for extension CSVs
+        extended_df = existing_df.copy()
+        max_existing_date = pd.to_datetime(existing_df["datadate"]).max()
+        
+        for csv_name in csv_candidates:
+            csv_path = resolve_path(csv_name, prefer_repo=True)
+            if not csv_path or not os.path.exists(csv_path):
+                continue
+            
+            log(f"Checking extension source: {csv_name}...")
+            new_df = pd.read_csv(csv_path, low_memory=False)
+            new_df["datadate"] = pd.to_datetime(new_df["datadate"], errors="coerce")
+            
+            # Only keep rows AFTER existing data
+            new_df = new_df[new_df["datadate"] > max_existing_date]
+            
+            if new_df.empty:
+                log(f"  No new rows after {max_existing_date.date()}")
+                continue
+            
+            log(f"  Found {len(new_df)} new rows after {max_existing_date.date()}")
+            
+            # 3. Align to existing schema (drop extra cols, add missing as NaN)
+            common_cols = [c for c in schema_cols if c in new_df.columns]
+            missing_cols = [c for c in schema_cols if c not in new_df.columns]
+            
+            log(f"  Common columns: {len(common_cols)}/{len(schema_cols)}")
+            if missing_cols:
+                log(f"  Missing columns (will be NaN): {missing_cols[:5]}{'...' if len(missing_cols) > 5 else ''}")
+            
+            # Subset to common columns, add missing as NaN
+            new_df_aligned = new_df[common_cols].copy()
+            for col in missing_cols:
+                new_df_aligned[col] = np.nan
+            
+            # Reorder to match schema
+            new_df_aligned = new_df_aligned[schema_cols]
+            
+            # Cast dtypes to match
+            for col, dtype in schema_dtypes.items():
+                try:
+                    new_df_aligned[col] = new_df_aligned[col].astype(dtype)
+                except (ValueError, TypeError):
+                    pass  # Keep as-is if cast fails
+            
+            # 4. Append
+            extended_df = pd.concat([extended_df, new_df_aligned], ignore_index=True)
+            log(f"  Extended to {len(extended_df)} total rows")
+        
+        # 5. Optionally save
+        if save_extended and len(extended_df) > len(existing_df):
+            save_path = parquet_path.replace(".parquet", "_extended.parquet")
+            extended_df.to_parquet(save_path, index=False)
+            log(f"  Saved extended data to {save_path}")
+        
+        results[data_type] = extended_df
+    
+    return results.get("quarterly", pd.DataFrame()), results.get("annual", pd.DataFrame())
+
+# Run extension check (don't save by default - just report)
+FUNDQ_EXTENDED, FUNDA_EXTENDED = extend_fundamentals(CONFIG, save_extended=False)
+log("✅ Cell A3 Complete: Fundamentals Extension Check.")
+
+# %% [markdown]
 # # Cell B: Load & Clean Panel (Truncation Diagnostics)
 #
 # **Goal**: Load Compustat data, apply 'STD' filter, and diagnose year coverage to ensure no data is silently dropped.
+
 
 # %%
 def load_and_prep_compustat(config):

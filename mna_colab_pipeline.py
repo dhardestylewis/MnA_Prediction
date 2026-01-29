@@ -172,22 +172,52 @@ def load_extended_deals(config):
     
     # --- Standardize FactSet XLS schema to match DMA corpus ---
     if not factset_df.empty:
-        # Common column mapping (adjust based on actual XLS headers)
-        col_map = {
-            "Target Name": "target",
-            "Acquirer Name": "acquirer", 
-            "Announce Date": "date_announcement",
-            "Deal ID": "FactSet ID",
-        }
-        factset_df = factset_df.rename(columns={k: v for k, v in col_map.items() if k in factset_df.columns})
+        # Debug: show actual column names from XLS files
+        log(f"  FactSet columns: {list(factset_df.columns)[:10]}...")
         
-        # Extract year from announcement date
-        if "date_announcement" in factset_df.columns:
-            factset_df["date_announcement"] = pd.to_datetime(factset_df["date_announcement"], errors="coerce")
+        # Flexible column mapping (case-insensitive matching)
+        col_lower_map = {c.lower(): c for c in factset_df.columns}
+        
+        # Find target column
+        for key in ["target", "target name", "targetname", "target company"]:
+            if key in col_lower_map:
+                factset_df = factset_df.rename(columns={col_lower_map[key]: "target"})
+                break
+        
+        # Find acquirer column
+        for key in ["acquirer", "acquirer name", "acquirername", "buyer"]:
+            if key in col_lower_map:
+                factset_df = factset_df.rename(columns={col_lower_map[key]: "acquirer"})
+                break
+        
+        # Find date column (for year extraction)
+        date_col = None
+        for key in ["announce date", "announced", "ann date", "announcement date", "date announced", "date"]:
+            if key in col_lower_map:
+                date_col = col_lower_map[key]
+                break
+        
+        if date_col:
+            factset_df["date_announcement"] = pd.to_datetime(factset_df[date_col], errors="coerce")
             factset_df["year"] = factset_df["date_announcement"].dt.year
+            log(f"  Extracted year from '{date_col}', range: {factset_df['year'].min()}-{factset_df['year'].max()}")
+        else:
+            # Fallback: try to infer from any datetime column
+            for col in factset_df.columns:
+                try:
+                    parsed = pd.to_datetime(factset_df[col], errors="coerce")
+                    if parsed.notna().sum() > len(factset_df) * 0.5:  # >50% valid dates
+                        factset_df["date_announcement"] = parsed
+                        factset_df["year"] = parsed.dt.year
+                        log(f"  Inferred year from '{col}', range: {factset_df['year'].min()}-{factset_df['year'].max()}")
+                        break
+                except:
+                    pass
+            else:
+                log("  [WARN] Could not extract year from FactSet XLS - no date column found")
     
     # --- Merge: DMA corpus + NEW deals from FactSet (2021+) ---
-    if not dma_df.empty and not factset_df.empty:
+    if not dma_df.empty and not factset_df.empty and "year" in factset_df.columns:
         # Only add FactSet deals that are AFTER DMA corpus coverage
         dma_max_year = dma_df["year"].max()
         new_deals = factset_df[factset_df["year"] > dma_max_year].copy()

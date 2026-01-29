@@ -542,24 +542,34 @@ log(f"✅ Cell B Complete. Panel has {len(panel_clean)} rows.")
 # %%
 import csv
 
-def load_deals_robust(config):
-    csv_path = os.path.join(config["base_dir"], config["inputs"]["deals"])
-    if not os.path.exists(csv_path):
-        log(f"[ERROR] Deal CSV not found: {csv_path}")
-        return pd.DataFrame()
+def load_deals_robust(config, preloaded_df=None):
+    if preloaded_df is not None and not preloaded_df.empty:
+        log(f"Using preloaded deals dataframe ({len(preloaded_df)} rows)...")
+        df = preloaded_df.copy()
+        
+        # Ensure date_announcement is mapped to ann_date if not already
+        if "date_announcement" in df.columns and "ann_date" not in df.columns:
+            df["ann_date"] = df["date_announcement"]
+            
+    else:
+        # Fallback: Load from CSV
+        csv_path = resolve_path(config["inputs"]["deals"])
+        if not csv_path or not os.path.exists(csv_path):
+            log(f"[ERROR] Deal CSV not found.")
+            return pd.DataFrame()
 
-    # Sniff delimiter
-    with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
-        sample = f.read(2048)
-        try:
-            dialect = csv.Sniffer().sniff(sample)
-            sep = dialect.delimiter
-        except:
-            sep = ","
-    
-    # Load
-    log(f"Loading deals with separator='{sep}'...")
-    df = pd.read_csv(csv_path, sep=sep, engine="python")
+        # Sniff delimiter
+        with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
+            sample = f.read(2048)
+            try:
+                dialect = csv.Sniffer().sniff(sample)
+                sep = dialect.delimiter
+            except:
+                sep = ","
+        
+        # Load
+        log(f"Loading deals with separator='{sep}'...")
+        df = pd.read_csv(csv_path, sep=sep, engine="python")
     
     # Normalize Cols
     col_map = {c: c.lower().strip().replace(" ", "").replace("_", "") for c in df.columns}
@@ -607,7 +617,7 @@ def load_deals_robust(config):
     out = out.sort_values("ann_date").reset_index(drop=True)
     return out
 
-deals_df = load_deals_robust(CONFIG)
+deals_df = load_deals_robust(CONFIG, preloaded_df=DEALS_DF)
 
 # Save
 deals_path = os.path.join(ARTIFACT_DIR, "deals.parquet")

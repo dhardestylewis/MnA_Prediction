@@ -641,9 +641,13 @@ def load_deals_robust(config, preloaded_df=None, tic_map=None):
         if "cik" not in df.columns:
             df["cik"] = np.nan
         
-        # Candidate ticker columns
+        # Candidate ticker columns (must check normalized names!)
+        # We also check original 'Target Ticker' just in case normalization missed it (unlikely)
+        # Normalized candidates: 'targetticker', 'ticker', 'symbol'
         tic_col = None
-        for cand in ["Target Ticker", "target ticker", "Symbol", "symbol", "Ticker", "ticker"]:
+        candidates = ["targetticker", "ticker", "symbol", "target_ticker", "Target Ticker"]
+        
+        for cand in candidates:
             if cand in df.columns:
                 tic_col = cand
                 break
@@ -655,6 +659,9 @@ def load_deals_robust(config, preloaded_df=None, tic_map=None):
                 clean_tics = df.loc[mask_missing, tic_col].astype(str).str.upper().str.strip()
                 df.loc[mask_missing, "cik"] = clean_tics.map(tic_map)
                 log(f"  Filled {df.loc[mask_missing, 'cik'].notna().sum()} CIKs.")
+        else:
+            log(f"[WARN] No Ticker column found in FactSet data. Available cols: {list(df.columns)}")
+            # If no ticker, we can't map. 2021+ data will trigger drop warning below.
 
     # --- Common Cleanup ---
     if "cik" in df.columns:

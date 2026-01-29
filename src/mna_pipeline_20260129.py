@@ -604,72 +604,47 @@ def load_deals_robust(config, preloaded_df=None, tic_map=None):
     
     # --- Common Normalization ---
     
-    # Map Columns if not preloaded (or strictly check existence)
-    if preloaded_df is None:
-        col_map = {c: c.lower().strip().replace(" ", "").replace("_", "") for c in df.columns}
-        rev_map = {v: k for k, v in col_map.items()} # normalized -> original
-        
-        rename_dict = {}
-        if "dateannouncement" in rev_map: rename_dict[rev_map["dateannouncement"]] = "ann_date"
-        if "cik" in rev_map: rename_dict[rev_map["cik"]] = "cik"
-        
-        val_candidates = ["dealvalue", "transactionvalue"]
-        val_orig = next((rev_map[v] for v in val_candidates if v in rev_map), None)
-        if val_orig:
-            rename_dict[val_orig] = "_deal_value_str"
-        
-        df.rename(columns=rename_dict, inplace=True)
-        
-        # CIK extraction
-        if "cik" not in df.columns and "url" in df.columns:
-            df["cik"] = df["url"].astype(str).str.extract(r'/data/(\d{1,10})/')
-            
-        # Clean Value
-        if "_deal_value_str" in df.columns:
-            df["_deal_value_num"] = pd.to_numeric(
-                df["_deal_value_str"].astype(str).str.replace(r"[^0-9.]", "", regex=True),
-                errors="coerce"
-            )
-            df["_deal_value_log"] = np.log1p(df["_deal_value_num"].fillna(0))
-        else:
-            df["_deal_value_num"] = np.nan
-            df["_deal_value_log"] = 0.0
+    # ALWAYS Normalize Cols (even for preloaded) to avoid case issues (CIK vs cik)
+    # This fixes data loss when preloaded df has 'CIK' but code expects 'cik'
+    col_map = {c: c.lower().strip().replace(" ", "").replace("_", "") for c in df.columns}
+    rev_map = {v: k for k, v in col_map.items()} # normalized -> original
+    
+    rename_dict = {}
+    if "dateannouncement" in rev_map: rename_dict[rev_map["dateannouncement"]] = "ann_date"
+    if "cik" in rev_map: rename_dict[rev_map["cik"]] = "cik"
+    
+    val_candidates = ["dealvalue", "transactionvalue"]
+    val_orig = next((rev_map[v] for v in val_candidates if v in rev_map), None)
+    if val_orig:
+        rename_dict[val_orig] = "_deal_value_str"
+    
+    df.rename(columns=rename_dict, inplace=True)
+
+    # CIK extraction (Regex from URL) - Fallback
+    if "cik" not in df.columns and "url" in df.columns:
+        df["cik"] = df["url"].astype(str).str.extract(r'/data/(\d{1,10})/')
 
     # --- Ticker Mapping (Crucial for FactSet) ---
-    # FactSet deals often lack CIK but have Target name/ticker
     if tic_map is not None:
-        # Check if we have missing CIKs
         if "cik" not in df.columns:
             df["cik"] = np.nan
         
-        # Check for potential ticker columns
-        # FactSet usually has 'Target' (Name) or 'Target Ticker'
-        # We'll valid candidates: 'Target Ticker', 'Symbol', 'Ticker'
+        # Candidate ticker columns
         tic_col = None
         for cand in ["Target Ticker", "target ticker", "Symbol", "symbol", "Ticker", "ticker"]:
             if cand in df.columns:
                 tic_col = cand
                 break
         
-        # If no specific ticker col, tries 'Target' (Company Name) ??? 
-        # No, 'tic' map expects Tickers (e.g. AAPL). Company Names won't match.
-        # So strict check for Ticker col.
-        
         if tic_col:
             mask_missing = df["cik"].isna()
-            n_missing = mask_missing.sum()
-            if n_missing > 0:
-                log(f"Mapping {n_missing} missing CIKs using ticker col '{tic_col}'...")
-                # map expects upper case tickers usually
-                # ensuring string cleaning
+            if mask_missing.sum() > 0:
+                log(f"Mapping {mask_missing.sum()} missing CIKs using ticker col '{tic_col}'...")
                 clean_tics = df.loc[mask_missing, tic_col].astype(str).str.upper().str.strip()
                 df.loc[mask_missing, "cik"] = clean_tics.map(tic_map)
-                
-                n_filled = df.loc[mask_missing, "cik"].notna().sum()
-                log(f"  Filled {n_filled} CIKs.")
+                log(f"  Filled {df.loc[mask_missing, 'cik'].notna().sum()} CIKs.")
 
-    # Common Cleanup
-    # Clean CIK
+    # --- Common Cleanup ---
     if "cik" in df.columns:
         df["cik"] = pd.to_numeric(df["cik"], errors="coerce").astype("Int64")
         initial_len = len(df)
@@ -681,12 +656,22 @@ def load_deals_robust(config, preloaded_df=None, tic_map=None):
         log("[ERROR] No CIK column found. Dropping ALL deals.")
         return pd.DataFrame(columns=["cik", "ann_date", "_deal_value_num", "_deal_value_log"])
     
-    # Clean Date
     if "ann_date" in df.columns:
         df["ann_date"] = pd.to_datetime(df["ann_date"], errors="coerce")
         df.dropna(subset=["ann_date"], inplace=True)
     
-    # Clean Value
+    # Value Cleaning
+    if "_deal_value_str" in df.columns:
+        df["_deal_value_num"] = pd.to_numeric(
+             df["_deal_value_str"].astype(str).str.replace(r"[^0-9.]", "", regex=True),
+             errors="coerce"
+        )
+        df["_deal_value_log"] = np.log1p(df["_deal_value_num"].fillna(0))
+    elif "_deal_value_num" in df.columns:
+         df["_deal_value_log"] = np.log1p(df["_deal_value_num"].fillna(0))
+    else:
+        df["_deal_value_num"] = np.nan
+        df["_deal_value_log"] = 0.0
     if "_deal_value_str" in df.columns:
         df["_deal_value_num"] = pd.to_numeric(
              df["_deal_value_str"].astype(str).str.replace(r"[^0-9.]", "", regex=True),

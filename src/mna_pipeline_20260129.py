@@ -638,9 +638,15 @@ def load_deals_robust(config, preloaded_df=None, tic_map=None):
 
     # --- Ticker Mapping (Crucial for FactSet) ---
     if tic_map is not None:
-        if "cik" not in df.columns:
+        # Force CIK to numeric first (handle empty strings which are not NA)
+        if "cik" in df.columns:
+            df["cik"] = pd.to_numeric(df["cik"], errors="coerce")
+        else:
             df["cik"] = np.nan
-        
+            
+        # Debug: Show columns for diagnostics
+        # log(f"DEBUG: Columns available for ticker rescue: {list(df.columns)}")
+
         # Candidate ticker columns (must check normalized names!)
         # We also check original 'Target Ticker' just in case normalization missed it (unlikely)
         # Normalized candidates: 'targetticker', 'ticker', 'symbol'
@@ -661,7 +667,6 @@ def load_deals_robust(config, preloaded_df=None, tic_map=None):
                 log(f"  Filled {df.loc[mask_missing, 'cik'].notna().sum()} CIKs.")
         else:
             log(f"[WARN] No Ticker column found in FactSet data. Available cols: {list(df.columns)}")
-            # If no ticker, we can't map. 2021+ data will trigger drop warning below.
 
     # --- Common Cleanup ---
     if "cik" in df.columns:
@@ -1038,7 +1043,7 @@ def dry_run_harness(df, target_col, n_trials=5, top_k=50):
     return pd.DataFrame(results), mean_jaccard
 
 # Prepare quarter column
-features_df["panel_q"] = features_df["datadate"].dt.to_period("Q")
+labeled_panel["panel_q"] = labeled_panel["datadate"].dt.to_period("Q")
 
 # Run Dry Run
 dry_res, stability_score = dry_run_harness(labeled_panel, "label_deal_0_3m", n_trials=CONFIG["calibration"]["n_dryrun_trials"])

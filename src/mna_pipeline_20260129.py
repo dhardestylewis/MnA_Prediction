@@ -655,9 +655,9 @@ log(f"✅ Cell C Complete. Loaded {len(deals_df)} deals. Saved to {deals_path}")
 from tqdm.auto import tqdm
 
 def feature_engineering(df):
-    log("Starting Vectorized Feature Engineering...")
+    log("Starting Vectorized Feature Engineering (CPU Optimized)...")
     
-    # 1. Base Var Coalescing (bfill optimized)
+    # 1. Base Var Coalescing (Optimized: Replaces slow bfill(axis=1))
     base_vars = {
         "assets":        ["atq", "at"],
         "revenue":       ["saleq", "sale"],
@@ -679,16 +679,20 @@ def feature_engineering(df):
         "mkvalt":        ["mkvaltq", "mkvalt"],
     }
     
+    # FAST COALESCING LOOP - Uses cascaded fillna() instead of bfill(axis=1)
     for var, cands in tqdm(base_vars.items(), desc="Coalescing Base Vars", leave=False):
         existing = [c for c in cands if c in df.columns]
         if not existing:
             df[var] = np.nan
-        elif len(existing) == 1:
-            df[var] = df[existing[0]]
         else:
-            df[var] = df[existing].bfill(axis=1).iloc[:, 0]
+            # Start with the first priority column
+            combined = df[existing[0]].copy()
+            # Fill missing values with subsequent columns in priority order
+            for next_col in existing[1:]:
+                combined = combined.fillna(df[next_col])
+            df[var] = combined
 
-    # 2. Ratios
+    # 2. Ratios (Vectorized - Fast)
     EPS = 1e-9
     def safe_mag(s): return s.fillna(0).abs() + EPS
     
@@ -705,8 +709,8 @@ def feature_engineering(df):
     df["capx_int"] = df["capx"]  / safe_mag(df["assets"])
     df["ocf_int"]  = df["oancf"] / safe_mag(df["assets"])
     
-    # Clip Ratios (Outlier protection)
-    ratio_cols = ["profit_margin", "roa", "oper_margin", "leverage", "curr_ratio",
+    # Clip Ratios
+    ratio_cols = ["profit_margin", "roa", "oper_margin", "leverage", "curr_ratio", 
                   "cash_ratio", "int_coverage", "rd_int", "sgna_int", "capx_int", "ocf_int"]
     df[ratio_cols] = df[ratio_cols].fillna(0).clip(-5, 5)
 
@@ -716,26 +720,20 @@ def feature_engineering(df):
     df["log_turnover"] = np.log1p(df["turnover"].fillna(0).clip(lower=0))
 
     # 4. Returns (fwd/back)
-    # Strict Sort required for shift
     df = df.sort_values(["gvkey", "datadate"]).reset_index(drop=True)
     
-    # --- Returns (1Q) ---
-    # Need to be careful with 'prccq'. 
     if "prccq" in df.columns:
-        # Backward 1Q (for momentum/correlation)
-        # Shift 1, check firm match
+        # Groupby Shift is somewhat slow on CPU, but manageable
         prev_price = df.groupby("gvkey")["prccq"].shift(1)
         df["ret_back_1q"] = (df["prccq"] / prev_price - 1.0)
         
-        # Forward 1Q (for target/PnL)
-        # Shift -1, check firm match
         next_price = df.groupby("gvkey")["prccq"].shift(-1)
         df["ret_fwd_1q"] = (next_price / df["prccq"] - 1.0)
     else:
         df["ret_back_1q"] = np.nan
         df["ret_fwd_1q"] = np.nan
 
-    # 5. Growth Rates (Global Shift Masked)
+    # 5. Growth Rates
     log_growth_inputs = ["assets", "revenue", "ppent", "mkvalt"]
     input_cols = []
     for raw in log_growth_inputs:
@@ -743,8 +741,7 @@ def feature_engineering(df):
         df[col] = np.log1p(df[raw].fillna(0).clip(lower=0))
         input_cols.append(col)
         
-    # Shifts
-    # Note: df is already sorted by gvkey, datadate
+    # Vectorized Shifts (Global Masking) - Much faster than groupby().shift() in loop
     gvkey = df["gvkey"]
     mask_1 = (gvkey == gvkey.shift(1))
     mask_4 = (gvkey == gvkey.shift(4))
@@ -763,7 +760,7 @@ def feature_engineering(df):
         
         # YoY
         prev_4 = df_shift_4[col].where(mask_4)
-        prev_1_annual = df_shift_1[col].where(mask_1) # Fallback for annual data
+        prev_1_annual = df_shift_1[col].where(mask_1) 
         yoy_prev = np.where(is_q, prev_4, prev_1_annual)
         
         df[f"dlog_{raw}_yoy"] = df[col] - yoy_prev

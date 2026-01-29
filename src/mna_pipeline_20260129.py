@@ -571,47 +571,69 @@ def load_deals_robust(config, preloaded_df=None):
         log(f"Loading deals with separator='{sep}'...")
         df = pd.read_csv(csv_path, sep=sep, engine="python")
     
-    # Normalize Cols
-    col_map = {c: c.lower().strip().replace(" ", "").replace("_", "") for c in df.columns}
-    rev_map = {v: k for k, v in col_map.items()} # normalized -> original
-    
-    # Rename known targets
-    # Expecting: 'cik', 'dateannouncement', 'dealvalue'
-    rename_dict = {}
-    if "dateannouncement" in rev_map: rename_dict[rev_map["dateannouncement"]] = "ann_date"
-    if "cik" in rev_map: rename_dict[rev_map["cik"]] = "cik"
-    
-    # Find value col
-    val_candidates = ["dealvalue", "transactionvalue"]
-    val_orig = next((rev_map[v] for v in val_candidates if v in rev_map), None)
-    if val_orig:
-        rename_dict[val_orig] = "_deal_value_str"
-    
-    df.rename(columns=rename_dict, inplace=True)
-    
-    # CIK extraction if url exists but cik col doesn't (fallback)
-    if "cik" not in df.columns and "url" in df.columns:
-        df["cik"] = df["url"].astype(str).str.extract(r'/data/(\d{1,10})/')
+    # If preloaded, we assume it's mostly good but just need final column selection
+    if preloaded_df is not None and not preloaded_df.empty:
+        # Just ensure CIK and Ann Date are present
+        if "cik" not in df.columns and "url" in df.columns:
+            df["cik"] = df["url"].astype(str).str.extract(r'/data/(\d{1,10})/')
         
-    # Clean CIK
+        # Ensure ann_date
+        if "ann_date" not in df.columns:
+            if "date_announcement" in df.columns:
+                 df["ann_date"] = df["date_announcement"]
+            elif "Announcement Date" in df.columns:
+                 df["ann_date"] = df["Announcement Date"]
+                 
+        # Ensure deal value
+        if "_deal_value_num" not in df.columns:
+            # FactSet usually has "Transaction Value (MM)"
+            val_col = next((c for c in df.columns if "Transaction Value" in c), None)
+            if val_col:
+                df["_deal_value_num"] = pd.to_numeric(df[val_col], errors="coerce")
+                df["_deal_value_log"] = np.log1p(df["_deal_value_num"].fillna(0))
+            else:
+                 df["_deal_value_num"] = np.nan
+                 df["_deal_value_log"] = 0.0
+
+    else:
+        # CSV Path - Full Normalization Logic
+        col_map = {c: c.lower().strip().replace(" ", "").replace("_", "") for c in df.columns}
+        rev_map = {v: k for k, v in col_map.items()} # normalized -> original
+        
+        # Rename known targets
+        rename_dict = {}
+        if "dateannouncement" in rev_map: rename_dict[rev_map["dateannouncement"]] = "ann_date"
+        if "cik" in rev_map: rename_dict[rev_map["cik"]] = "cik"
+        
+        val_candidates = ["dealvalue", "transactionvalue"]
+        val_orig = next((rev_map[v] for v in val_candidates if v in rev_map), None)
+        if val_orig:
+            rename_dict[val_orig] = "_deal_value_str"
+        
+        df.rename(columns=rename_dict, inplace=True)
+        
+        # CIK extraction
+        if "cik" not in df.columns and "url" in df.columns:
+            df["cik"] = df["url"].astype(str).str.extract(r'/data/(\d{1,10})/')
+            
+        # Clean Value
+        if "_deal_value_str" in df.columns:
+            df["_deal_value_num"] = pd.to_numeric(
+                df["_deal_value_str"].astype(str).str.replace(r"[^0-9.]", "", regex=True),
+                errors="coerce"
+            )
+            df["_deal_value_log"] = np.log1p(df["_deal_value_num"].fillna(0))
+        else:
+            df["_deal_value_num"] = np.nan
+            df["_deal_value_log"] = 0.0
+
+    # Common Cleanup
     df["cik"] = pd.to_numeric(df["cik"], errors="coerce").astype("Int64")
     df.dropna(subset=["cik"], inplace=True)
     
-    # Clean Date
     df["ann_date"] = pd.to_datetime(df["ann_date"], errors="coerce")
     df.dropna(subset=["ann_date"], inplace=True)
     
-    # Clean Value
-    if "_deal_value_str" in df.columns:
-        df["_deal_value_num"] = pd.to_numeric(
-            df["_deal_value_str"].astype(str).str.replace(r"[^0-9.]", "", regex=True),
-            errors="coerce"
-        )
-        df["_deal_value_log"] = np.log1p(df["_deal_value_num"].fillna(0))
-    else:
-        df["_deal_value_num"] = np.nan
-        df["_deal_value_log"] = 0.0
-        
     # Select final
     out = df[["cik", "ann_date", "_deal_value_num", "_deal_value_log"]].copy()
     out = out.sort_values("ann_date").reset_index(drop=True)

@@ -37,7 +37,7 @@ MnA_Prediction/
 |--------|----------|----------|
 | **Compustat** (fundq/funda) | Google Drive | Through ~2020 |
 | **DMA Corpus** | `data/deals/` | 2000-2020 |
-| **FactSet XLS** | `data/deals/factset_xls/` | 2000-2025 |
+| **FactSet XLS** | `data/deals/factset_xls/factset_2000_2025/` | 2000-2025 |
 
 ## Pipeline Features
 

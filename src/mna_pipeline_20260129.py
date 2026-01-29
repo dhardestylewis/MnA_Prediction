@@ -86,7 +86,7 @@ CONFIG = {
         "funda": "funda_full.parquet",
         # Smaller files -> GitHub repo preferred (new directory structure)
         "deals": "data/deals/dma_corpus_metadata_with_factset_id.csv",
-        "factset_xls_dir": "data/deals/factset_xls",
+        "factset_xls_dir": "data/deals/factset_xls/factset_2000_2025",
         "fundamentals_csv": "data/fundamentals/compustat_funda_2000on.csv"
     },
     "horizons_months": [3, 6, 9, 12, 15, 18, 21, 24],
@@ -113,6 +113,45 @@ with open(config_path, "w") as f:
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+# ================================================
+# CHECKPOINT / RESUME INFRASTRUCTURE
+# ================================================
+# Set RESUME_FROM_RUN_ID to resume from a previous run's checkpoints
+# Leave as None to start fresh
+RESUME_FROM_RUN_ID = None  # e.g., "20260129_222354" to resume
+
+# Determine checkpoint directory
+if RESUME_FROM_RUN_ID:
+    CHECKPOINT_DIR = os.path.join(DRIVE_DIR, CONFIG["artifact_subfolder"], RESUME_FROM_RUN_ID)
+    if os.path.exists(CHECKPOINT_DIR):
+        log(f"♻️ RESUMING from run: {RESUME_FROM_RUN_ID}")
+    else:
+        log(f"[WARN] Resume run {RESUME_FROM_RUN_ID} not found, starting fresh")
+        CHECKPOINT_DIR = ARTIFACT_DIR
+else:
+    CHECKPOINT_DIR = ARTIFACT_DIR
+
+def checkpoint_exists(name):
+    """Check if a checkpoint file exists."""
+    path = os.path.join(CHECKPOINT_DIR, f"{name}.parquet")
+    return os.path.exists(path)
+
+def save_checkpoint(df, name):
+    """Save DataFrame checkpoint to Drive."""
+    path = os.path.join(ARTIFACT_DIR, f"{name}.parquet")
+    df.to_parquet(path, index=False)
+    log(f"💾 Checkpoint saved: {name} ({len(df)} rows)")
+    return path
+
+def load_checkpoint(name):
+    """Load DataFrame from checkpoint."""
+    path = os.path.join(CHECKPOINT_DIR, f"{name}.parquet")
+    if os.path.exists(path):
+        df = pd.read_parquet(path)
+        log(f"📂 Checkpoint loaded: {name} ({len(df)} rows)")
+        return df
+    return None
 
 log("✅ Cell A Complete: Environment Setup.")
 
@@ -451,14 +490,10 @@ def load_and_prep_compustat(config):
         # Requirement: "Detect ANY change... Flag potential back-adjustment"
         # Usually we flag the whole firm history if unstable, or forward from change.
         # Here we flag forward from first change to be safe (conservative).
-        df["price_pit_risk_flag"] = (
-            df.groupby("gvkey")[c].transform(lambda x: x.diff().ne(0).cumsum() > 1) 
-            if adj_cols else 0
-        ).astype(int) # Simplified proxy, real logic is 'has_change' cumsum
         
-        # Re-implementing exact logic from prev script for fidelity
+        # Use has_change directly - simpler and avoids NA issues
         df["_raw_change"] = has_change.astype(int)
-        df["price_pit_risk_flag"] = df.groupby("gvkey")["_raw_change"].transform("cumsum").gt(0).astype(int)
+        df["price_pit_risk_flag"] = df.groupby("gvkey")["_raw_change"].transform("cumsum").fillna(0).gt(0).astype(int)
         df.drop(columns=["_raw_change"], inplace=True)
     else:
         df["price_pit_risk_flag"] = 0
@@ -490,12 +525,14 @@ def load_and_prep_compustat(config):
 
     return df
 
-panel_clean = load_and_prep_compustat(CONFIG)
+# Check for checkpoint before running expensive computation
+if checkpoint_exists("panel_clean"):
+    panel_clean = load_checkpoint("panel_clean")
+else:
+    panel_clean = load_and_prep_compustat(CONFIG)
+    save_checkpoint(panel_clean, "panel_clean")
 
-# Save
-clean_path = os.path.join(ARTIFACT_DIR, "panel_clean.parquet")
-panel_clean.to_parquet(clean_path, index=False)
-log(f"✅ Cell B Complete. Saved cleaned panel to {clean_path}")
+log(f"✅ Cell B Complete. Panel has {len(panel_clean)} rows.")
 
 # %% [markdown]
 # # Cell C: Load & Normalize Deals

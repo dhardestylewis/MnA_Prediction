@@ -98,7 +98,41 @@ CONFIG = {
     "calibration": {
         "test_size_qtrs": 8,  # Not strictly used in expanding window, but for ref
         "n_dryrun_trials": 5
-    }
+    },
+    # ================================================
+    # COMPILE-ONCE / TRAIN-MANY CONFIGURATION (NEW)
+    # ================================================
+    "compile": {
+        "force_recompile": False,  # Set True to bypass cache
+        "use_memmap": True,        # Use memmap for X_global (memory efficient)
+    },
+    "sampling": {
+        "enabled": True,           # Enable negative sampling for speed
+        "neg_pos_ratio_dev": 10,   # 10:1 for dev mode
+        "neg_pos_ratio_std": 20,   # 20:1 for standard mode  
+        "use_sample_weights": True,  # Correct for sampling bias
+    },
+    "inner_loop": {
+        "enabled": False,          # Set True to run single quarter (fast dev)
+        "quarter": None,           # e.g., "2020Q4" - if None, pick automatically
+        "horizon": 3,              # Single horizon for inner loop
+    },
+    "automl": {
+        "n_configs": 8,            # Number of random HP configs
+        "budget_small": 100,       # Trees for initial halving round
+        "top_k_advance": 2,        # How many configs advance to full training
+    },
+    "stability": {
+        "enabled": True,
+        "min_repeats": 5,          # Start with 5 repeats
+        "max_repeats": 20,         # Max repeats if CI not met
+        "top_k": 50,               # For Jaccard@K
+        "jaccard_ci_threshold": 0.10,  # CI half-width threshold
+        "return_ci_threshold": 0.02,   # 2% CI half-width for returns
+    },
+    "benchmark": {
+        "spy_fail_fast": True,     # Fail if SPY returns missing
+    },
 }
 
 # 6. Create Artifact Directory (on Google Drive for persistence)
@@ -183,6 +217,848 @@ def load_checkpoint(name):
     return None
 
 log("✅ Cell A Complete: Environment Setup.")
+
+# %% [markdown]
+# # Cell A1: COMPILE-ONCE / TRAIN-MANY Infrastructure
+#
+# **Goal**: Implement two-phase architecture where feature engineering happens once (cached),
+# and training/eval uses only array slicing for fast iteration.
+#
+# **Phase A: COMPILE** (slow, amortized, cached)
+# - Load raw data, clean/filter, feature engineering, multi-horizon labeling
+# - Produce global float32 design matrix and row indices by quarter
+#
+# **Phase B: TRAIN/EVAL** (fast, repeated, ≤60s target)
+# - Slice by precomputed indices, optional sampling, train with early stopping
+# - No Pandas joins, no dtype inference, no feature engineering
+
+# %%
+import hashlib
+import subprocess
+import psutil
+from dataclasses import dataclass, field
+from typing import Optional, Dict, List, Tuple, Any
+from scipy import stats
+
+# Try to import LightGBM (preferred) or fall back to sklearn
+try:
+    import lightgbm as lgb
+    HAS_LIGHTGBM = True
+    log("[INFO] LightGBM available")
+except ImportError:
+    HAS_LIGHTGBM = False
+    log("[WARN] LightGBM not available, using HistGradientBoosting")
+
+# ================================================
+# COMPILE-ONCE INFRASTRUCTURE
+# ================================================
+
+@dataclass
+class CompileArtifacts:
+    """References to compiled artifacts for fast train/eval."""
+    # Core arrays
+    X_global: np.ndarray = None          # float32 design matrix
+    feature_names: List[str] = None       # Column names aligned to X
+    y_by_horizon: Dict[int, np.ndarray] = None  # uint8 labels per horizon
+    quarter_ids: np.ndarray = None        # Quarter string per row
+    
+    # Pre-computed splits (train rows before quarter, test rows in quarter)
+    rows_train_by_quarter: Dict[str, np.ndarray] = None
+    rows_test_by_quarter: Dict[str, np.ndarray] = None
+    
+    # Metadata for attribution
+    metadata_gvkey: np.ndarray = None
+    metadata_cik: np.ndarray = None
+    metadata_datadate: np.ndarray = None
+    metadata_ret_fwd: np.ndarray = None   # Forward returns for portfolio
+    
+    # Data coverage tracking (R5.D)
+    dropped_deals_by_quarter: Dict[str, int] = None  # Deals dropped due to missing CIK
+    coverage_rate_by_quarter: Dict[str, float] = None  # % of deals with valid mapping
+    
+    # Cache info
+    cache_key: str = ""
+    cache_hit: bool = False
+    compile_seconds: float = 0.0
+    n_rows: int = 0
+    n_features: int = 0
+
+def get_git_commit_hash():
+    """Get current git commit hash for cache keying."""
+    try:
+        result = subprocess.run(["git", "rev-parse", "HEAD"], 
+                                capture_output=True, text=True, timeout=5, cwd=REPO_DIR)
+        if result.returncode == 0:
+            return result.stdout.strip()[:12]
+    except Exception:
+        pass
+    return "unknown"
+
+def compute_file_hash(filepath):
+    """Compute hash from file mtime and size."""
+    if not os.path.exists(filepath):
+        return "missing"
+    stat = os.stat(filepath)
+    return hashlib.md5(f"{stat.st_mtime}:{stat.st_size}".encode()).hexdigest()[:16]
+
+def compute_compile_cache_key(config):
+    """Compute deterministic cache key for compile phase."""
+    parts = []
+    # Input file hashes
+    for key in ["fundq", "funda"]:
+        path = os.path.join(config["drive_dir"], config["inputs"][key])
+        parts.append(f"{key}:{compute_file_hash(path)}")
+    
+    deals_path = resolve_path(config["inputs"]["deals"])
+    parts.append(f"deals:{compute_file_hash(deals_path) if deals_path else 'missing'}")
+    
+    # Config parameters affecting compile
+    parts.append(f"lag:{config['safe_lag_days']}")
+    parts.append(f"horizons:{','.join(map(str, config['horizons_months']))}")
+    parts.append(f"keyset:{config['filters']['keyset']}")
+    parts.append(f"git:{get_git_commit_hash()}")
+    
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:32]
+
+def get_rss_mb():
+    """Get current process RSS in MB."""
+    try:
+        return psutil.Process().memory_info().rss / 1e6
+    except:
+        return 0.0
+
+# ================================================
+# TIMING LOGGER
+# ================================================
+
+class TimingLogger:
+    """Structured timing logger for compile/train phases."""
+    def __init__(self, artifact_dir):
+        self.artifact_dir = artifact_dir
+        self.logs_dir = os.path.join(artifact_dir, "logs")
+        os.makedirs(self.logs_dir, exist_ok=True)
+        self.csv_path = os.path.join(self.logs_dir, "timing.csv")
+        self.rows = []
+        
+    def log_phase(self, phase, **kwargs):
+        """Log a timing entry."""
+        entry = {"phase": phase, "run_id": CONFIG["run_id"], "timestamp": datetime.now().isoformat()}
+        entry.update(kwargs)
+        self.rows.append(entry)
+        
+    def save(self):
+        """Write timing.csv."""
+        if self.rows:
+            df = pd.DataFrame(self.rows)
+            df.to_csv(self.csv_path, index=False)
+            log(f"📊 Timing log saved: {self.csv_path}")
+            
+    def write_summary(self, compile_time, backtest_time, stability_time, cache_hits, cache_misses, dropped_deals):
+        """Write summary.txt."""
+        summary_path = os.path.join(self.logs_dir, "summary.txt")
+        with open(summary_path, "w") as f:
+            f.write(f"Compile time: {compile_time:.1f}s\n")
+            f.write(f"Backtest time: {backtest_time:.1f}s\n")
+            f.write(f"Stability suite time: {stability_time:.1f}s\n")
+            f.write(f"Cache hits: {cache_hits}\n")
+            f.write(f"Cache misses: {cache_misses}\n")
+            f.write(f"Dropped deals (missing CIK): {dropped_deals}\n")
+
+TIMING_LOGGER = TimingLogger(ARTIFACT_DIR)
+
+# ================================================
+# TRAIN_EVAL_ONE: Fast array-only training
+# ================================================
+
+@dataclass
+class TrainTask:
+    """Specification for a single train/eval task."""
+    quarter: str
+    horizon_months: int
+    seed: int = 42
+    config_id: str = "default"
+    hp_config: Dict = field(default_factory=dict)
+    
+@dataclass 
+class FitResult:
+    """Result from a single train/eval run."""
+    predictions: np.ndarray              # p_raw
+    predictions_calibrated: np.ndarray = None   # p_calibrated (isotonic)
+    predictions_rescaled: np.ndarray = None     # p_rescaled (empirical prior)
+    metrics: Dict[str, float] = None
+    timing: Dict[str, float] = None
+    memory: Dict[str, float] = None
+    n_train: int = 0
+    n_test: int = 0
+
+def train_eval_one(task: TrainTask, artifacts: CompileArtifacts, 
+                   sampling_config: Dict = None) -> FitResult:
+    """
+    Fast train/eval for a single (quarter, horizon, seed, hp_config).
+    
+    CRITICAL: This function uses ONLY array slicing. No Pandas operations.
+    Target: ≤60 seconds with sampling enabled.
+    """
+    from sklearn.metrics import roc_auc_score, brier_score_loss, precision_recall_curve, auc
+    
+    t_start = time.time()
+    rss_before = get_rss_mb()
+    
+    # 1. Slice by precomputed indices (FAST - no Pandas)
+    t_slice_start = time.time()
+    train_idx = artifacts.rows_train_by_quarter.get(task.quarter, np.array([], dtype=np.int32))
+    test_idx = artifacts.rows_test_by_quarter.get(task.quarter, np.array([], dtype=np.int32))
+    
+    if len(train_idx) == 0 or len(test_idx) == 0:
+        return FitResult(
+            predictions=np.array([]),
+            metrics={"error": "empty_split"},
+            timing={"total_seconds": time.time() - t_start},
+            memory={"rss_before_mb": rss_before, "rss_after_mb": get_rss_mb()},
+            n_train=0, n_test=0
+        )
+    
+    # Get label column
+    y_full = artifacts.y_by_horizon.get(task.horizon_months)
+    if y_full is None:
+        return FitResult(
+            predictions=np.array([]),
+            metrics={"error": "missing_horizon"},
+            timing={"total_seconds": time.time() - t_start},
+            memory={"rss_before_mb": rss_before, "rss_after_mb": get_rss_mb()},
+            n_train=0, n_test=0
+        )
+    
+    # Slice arrays
+    X_train = artifacts.X_global[train_idx]
+    y_train = y_full[train_idx]
+    X_test = artifacts.X_global[test_idx]
+    y_test = y_full[test_idx]
+    
+    t_slice = time.time() - t_slice_start
+    
+    # 2. Apply sampling (optional, for speed)
+    t_sample_start = time.time()
+    sample_weight = None
+    if sampling_config and sampling_config.get("enabled", False):
+        pos_mask = y_train == 1
+        neg_mask = y_train == 0
+        n_pos = pos_mask.sum()
+        n_neg = neg_mask.sum()
+        
+        if n_pos > 0 and n_neg > n_pos:
+            ratio = sampling_config.get("neg_pos_ratio_dev", 10)
+            n_neg_sample = min(n_neg, n_pos * ratio)
+            
+            rng = np.random.default_rng(task.seed)
+            neg_idx = np.where(neg_mask)[0]
+            neg_sample_idx = rng.choice(neg_idx, size=int(n_neg_sample), replace=False)
+            pos_idx = np.where(pos_mask)[0]
+            
+            sample_idx = np.concatenate([pos_idx, neg_sample_idx])
+            rng.shuffle(sample_idx)
+            
+            X_train = X_train[sample_idx]
+            y_train = y_train[sample_idx]
+            
+            # Compute sample weights to correct for sampling bias
+            if sampling_config.get("use_sample_weights", True):
+                # Weight negatives higher to account for undersampling
+                true_neg_ratio = n_neg / (n_pos + n_neg)
+                sample_neg_ratio = n_neg_sample / (n_pos + n_neg_sample)
+                neg_weight = true_neg_ratio / sample_neg_ratio
+                sample_weight = np.where(y_train == 1, 1.0, neg_weight)
+    
+    t_sample = time.time() - t_sample_start
+    
+    # 3. Train model
+    t_fit_start = time.time()
+    hp = task.hp_config or {}
+    
+    if HAS_LIGHTGBM:
+        params = {
+            "objective": "binary",
+            "metric": "auc",
+            "verbosity": -1,
+            "seed": task.seed,
+            "num_leaves": hp.get("num_leaves", 31),
+            "min_data_in_leaf": hp.get("min_data_in_leaf", 20),
+            "feature_fraction": hp.get("feature_fraction", 0.8),
+            "bagging_fraction": hp.get("bagging_fraction", 0.8),
+            "bagging_freq": hp.get("bagging_freq", 5),
+            "lambda_l2": hp.get("lambda_l2", 0.1),
+            "learning_rate": hp.get("learning_rate", 0.05),
+            "n_estimators": hp.get("n_estimators", 200),
+        }
+        
+        train_data = lgb.Dataset(X_train, label=y_train, weight=sample_weight, free_raw_data=False)
+        
+        # Early stopping with 10% validation split from training
+        n_val = max(100, int(len(X_train) * 0.1))
+        val_data = lgb.Dataset(X_train[-n_val:], label=y_train[-n_val:], reference=train_data)
+        
+        model = lgb.train(
+            params,
+            train_data,
+            num_boost_round=params.pop("n_estimators"),
+            valid_sets=[val_data],
+            callbacks=[lgb.early_stopping(stopping_rounds=20, verbose=False)]
+        )
+        
+        t_fit = time.time() - t_fit_start
+        
+        # 4. Predict
+        t_predict_start = time.time()
+        predictions = model.predict(X_test)
+        t_predict = time.time() - t_predict_start
+        
+    else:
+        # Fallback to sklearn
+        from sklearn.ensemble import HistGradientBoostingClassifier
+        
+        model = HistGradientBoostingClassifier(
+            learning_rate=hp.get("learning_rate", 0.05),
+            max_depth=hp.get("max_depth", 5),
+            max_iter=hp.get("n_estimators", 200),
+            random_state=task.seed,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=20
+        )
+        
+        model.fit(X_train, y_train, sample_weight=sample_weight)
+        t_fit = time.time() - t_fit_start
+        
+        t_predict_start = time.time()
+        predictions = model.predict_proba(X_test)[:, 1]
+        t_predict = time.time() - t_predict_start
+    
+    # 5. Compute metrics
+    t_eval_start = time.time()
+    metrics = {}
+    
+    try:
+        metrics["auc"] = roc_auc_score(y_test, predictions)
+    except:
+        metrics["auc"] = 0.5
+    
+    try:
+        metrics["brier"] = brier_score_loss(y_test, predictions)
+    except:
+        metrics["brier"] = 0.25
+    
+    try:
+        precision, recall, _ = precision_recall_curve(y_test, predictions)
+        metrics["pr_auc"] = auc(recall, precision)
+    except:
+        metrics["pr_auc"] = 0.0
+    
+    metrics["n_positives_train"] = int(y_train.sum())
+    metrics["n_positives_test"] = int(y_test.sum())
+    metrics["base_rate_test"] = float(y_test.mean())
+    
+    t_eval = time.time() - t_eval_start
+    rss_after = get_rss_mb()
+    
+    # Log timing
+    TIMING_LOGGER.log_phase(
+        "train_eval",
+        quarter=task.quarter,
+        horizon_mo=task.horizon_months,
+        repeat_id=task.seed,
+        config_id=task.config_id,
+        n_train_rows=len(train_idx),
+        n_test_rows=len(test_idx),
+        n_features=artifacts.n_features,
+        slice_seconds=t_slice,
+        fit_seconds=t_fit,
+        predict_seconds=t_predict,
+        eval_seconds=t_eval,
+        total_seconds=time.time() - t_start,
+        rss_before_mb=rss_before,
+        rss_after_mb=rss_after
+    )
+    
+    # 6. Calibration (Isotonic regression on train data)
+    predictions_calibrated = None
+    try:
+        from sklearn.isotonic import IsotonicRegression
+        # Fit isotonic regression on train predictions vs actuals
+        if len(y_train) > 50:
+            ir = IsotonicRegression(out_of_bounds='clip')
+            # Get predictions on training data
+            if HAS_LIGHTGBM:
+                train_preds = model.predict(X_train)
+            else:
+                train_preds = model.predict_proba(X_train)[:, 1]
+            ir.fit(train_preds, y_train)
+            predictions_calibrated = ir.transform(predictions)
+    except Exception as e:
+        log(f"  [WARN] Calibration failed: {e}")
+        predictions_calibrated = predictions  # Fallback to raw
+    
+    # 7. Rescaling (empirical prior adjustment for strategy alignment)
+    # Rescale predictions to match realized deal rates
+    predictions_rescaled = None
+    try:
+        base_rate_train = y_train.mean()
+        base_rate_pop = 0.02  # Approximate population base rate for M&A deals
+        if base_rate_train > 0 and base_rate_pop > 0:
+            # Adjust for sampling bias in training data
+            scale_factor = base_rate_pop / base_rate_train
+            predictions_rescaled = predictions * scale_factor
+            predictions_rescaled = np.clip(predictions_rescaled, 0, 1)
+    except Exception as e:
+        log(f"  [WARN] Rescaling failed: {e}")
+        predictions_rescaled = predictions
+    
+    return FitResult(
+        predictions=predictions,
+        predictions_calibrated=predictions_calibrated,
+        predictions_rescaled=predictions_rescaled,
+        metrics=metrics,
+        timing={
+            "slice_seconds": t_slice,
+            "sample_seconds": t_sample,
+            "fit_seconds": t_fit,
+            "predict_seconds": t_predict,
+            "eval_seconds": t_eval,
+            "total_seconds": time.time() - t_start
+        },
+        memory={"rss_before_mb": rss_before, "rss_after_mb": rss_after},
+        n_train=len(X_train),
+        n_test=len(X_test)
+    )
+
+# ================================================
+# PORTFOLIO SIMULATION
+# ================================================
+
+def simulate_portfolio(predictions: np.ndarray, 
+                       metadata_ret_fwd: np.ndarray,
+                       strategy_config: Dict = None) -> Dict:
+    """
+    Simulate portfolio returns from predictions.
+    
+    Args:
+        predictions: Model probability scores for test set
+        metadata_ret_fwd: Forward returns aligned to test set
+        strategy_config: Configuration dict with:
+            - top_k: Number of holdings (default: 50)
+            - weight_scheme: 'equal' or 'score_weighted'
+            - clip_returns: (min, max) to clip outlier returns
+    
+    Returns:
+        Dict with returns, exposures, turnover, concentration (HHI)
+    """
+    if strategy_config is None:
+        strategy_config = {}
+    
+    top_k = strategy_config.get("top_k", 50)
+    weight_scheme = strategy_config.get("weight_scheme", "equal")
+    clip_min, clip_max = strategy_config.get("clip_returns", (-0.5, 1.0))
+    
+    if len(predictions) == 0 or metadata_ret_fwd is None:
+        return {"error": "insufficient_data"}
+    
+    # Select top-K
+    top_k_actual = min(top_k, len(predictions))
+    top_k_idx = np.argsort(predictions)[-top_k_actual:]
+    
+    # Get returns for selected holdings
+    selected_returns = metadata_ret_fwd[top_k_idx]
+    selected_returns = np.clip(selected_returns, clip_min, clip_max)
+    
+    # Compute weights
+    if weight_scheme == "score_weighted":
+        scores = predictions[top_k_idx]
+        weights = scores / scores.sum()
+    else:  # equal
+        weights = np.ones(len(top_k_idx)) / len(top_k_idx)
+    
+    # Portfolio return
+    portfolio_return = np.sum(weights * selected_returns)
+    
+    # Concentration (HHI)
+    hhi = np.sum(weights ** 2)
+    
+    # Universe return for comparison
+    universe_return = np.nanmean(np.clip(metadata_ret_fwd, clip_min, clip_max))
+    
+    return {
+        "portfolio_return": float(portfolio_return),
+        "universe_return": float(universe_return),
+        "excess_return": float(portfolio_return - universe_return),
+        "n_holdings": int(top_k_actual),
+        "hhi": float(hhi),
+        "top_score_min": float(predictions[top_k_idx].min()),
+        "top_score_max": float(predictions[top_k_idx].max()),
+        "hit_rate": float(np.mean(selected_returns > 0)),
+    }
+
+# ================================================
+# ONE-SHOT AUTOML WITH HALVING
+# ================================================
+
+def generate_hp_configs(n_configs, seed=42):
+    """Generate random hyperparameter configurations for LightGBM."""
+    rng = np.random.default_rng(seed)
+    configs = []
+    
+    for i in range(n_configs):
+        configs.append({
+            "config_id": f"hp_{i}",
+            "num_leaves": int(rng.choice([15, 31, 63, 127])),
+            "min_data_in_leaf": int(rng.choice([10, 20, 50, 100])),
+            "feature_fraction": float(rng.uniform(0.6, 1.0)),
+            "bagging_fraction": float(rng.uniform(0.6, 1.0)),
+            "lambda_l2": float(rng.choice([0.0, 0.1, 1.0, 10.0])),
+            "learning_rate": float(rng.choice([0.01, 0.03, 0.05, 0.1])),
+            "n_estimators": 100,  # Small budget for initial round
+        })
+    
+    return configs
+
+def run_one_shot_automl(quarter, horizon, artifacts, automl_config, sampling_config):
+    """
+    One-shot AutoML with successive halving.
+    
+    1. Start with n_configs random HP configs at small budget
+    2. Keep top_k_advance best configs
+    3. Train top configs to full early stopping
+    4. Return best config + trial table
+    """
+    log(f"🔍 Running One-Shot AutoML: {quarter} horizon={horizon}m")
+    t_start = time.time()
+    
+    n_configs = automl_config.get("n_configs", 8)
+    budget_small = automl_config.get("budget_small", 100)
+    top_k = automl_config.get("top_k_advance", 2)
+    
+    # Round 1: Small budget evaluation
+    configs = generate_hp_configs(n_configs)
+    round1_results = []
+    
+    for cfg in configs:
+        cfg["n_estimators"] = budget_small
+        task = TrainTask(quarter=quarter, horizon_months=horizon, seed=42, 
+                        config_id=cfg["config_id"], hp_config=cfg)
+        result = train_eval_one(task, artifacts, sampling_config)
+        round1_results.append({
+            "config": cfg,
+            "auc": result.metrics.get("auc", 0.5),
+            "fit_seconds": result.timing.get("fit_seconds", 0)
+        })
+    
+    # Sort by AUC descending
+    round1_results.sort(key=lambda x: x["auc"], reverse=True)
+    top_configs = [r["config"] for r in round1_results[:top_k]]
+    
+    log(f"  Round 1: Top {top_k} of {n_configs} configs selected (best AUC={round1_results[0]['auc']:.3f})")
+    
+    # Round 2: Full training with early stopping
+    round2_results = []
+    for cfg in top_configs:
+        cfg["n_estimators"] = 500  # Full budget
+        task = TrainTask(quarter=quarter, horizon_months=horizon, seed=42,
+                        config_id=cfg["config_id"], hp_config=cfg)
+        result = train_eval_one(task, artifacts, sampling_config)
+        round2_results.append({
+            "config": cfg,
+            "auc": result.metrics.get("auc", 0.5),
+            "predictions": result.predictions
+        })
+    
+    # Select best
+    round2_results.sort(key=lambda x: x["auc"], reverse=True)
+    best = round2_results[0]
+    
+    elapsed = time.time() - t_start
+    log(f"  AutoML complete: best AUC={best['auc']:.3f} in {elapsed:.1f}s")
+    
+    TIMING_LOGGER.log_phase(
+        "automl_trial",
+        quarter=quarter,
+        horizon_mo=horizon,
+        n_configs=n_configs,
+        top_k=top_k,
+        best_auc=best["auc"],
+        total_seconds=elapsed
+    )
+    
+    return best["config"], best["predictions"], round1_results + round2_results
+
+# ================================================
+# STABILITY SUITE
+# ================================================
+
+def compute_jaccard(set1, set2):
+    """Compute Jaccard similarity between two sets."""
+    intersection = len(set1 & set2)
+    union = len(set1 | set2)
+    return intersection / union if union > 0 else 0.0
+
+def run_stability_suite(quarter, horizon, artifacts, stability_config, sampling_config):
+    """
+    Run stability certification suite with sequential stopping.
+    
+    Measures:
+    - Rank stability (Spearman, Jaccard@K)
+    - Probability stability (per-name std, distribution metrics)
+    - Returns stability (portfolio return distribution)
+    
+    Sequential stopping: Start R=5, increase to R=10/20 if CI thresholds not met.
+    """
+    log(f"📊 Running Stability Suite: {quarter} horizon={horizon}m")
+    
+    min_repeats = stability_config.get("min_repeats", 5)
+    max_repeats = stability_config.get("max_repeats", 20)
+    top_k = stability_config.get("top_k", 50)
+    jaccard_threshold = stability_config.get("jaccard_ci_threshold", 0.10)
+    return_threshold = stability_config.get("return_ci_threshold", 0.02)
+    
+    test_idx = artifacts.rows_test_by_quarter.get(quarter, np.array([]))
+    if len(test_idx) == 0:
+        return {"error": "no_test_data"}
+    
+    # Get forward returns for portfolio simulation
+    ret_fwd = artifacts.metadata_ret_fwd[test_idx] if artifacts.metadata_ret_fwd is not None else None
+    
+    all_predictions = []
+    all_top_k_sets = []
+    all_portfolio_returns = []
+    
+    def check_convergence(jaccards, returns):
+        """Check if CI half-widths are below thresholds."""
+        if len(jaccards) < 3:
+            return False
+        
+        jaccard_ci = 1.96 * np.std(jaccards) / np.sqrt(len(jaccards))
+        
+        if len(returns) > 0 and not all(np.isnan(returns)):
+            valid_returns = [r for r in returns if not np.isnan(r)]
+            if len(valid_returns) >= 3:
+                return_ci = 1.96 * np.std(valid_returns) / np.sqrt(len(valid_returns))
+            else:
+                return_ci = float('inf')
+        else:
+            return_ci = 0  # No returns to check
+        
+        return jaccard_ci <= jaccard_threshold and return_ci <= return_threshold
+    
+    for r in range(max_repeats):
+        seed = 42 + r
+        task = TrainTask(quarter=quarter, horizon_months=horizon, seed=seed, config_id=f"repeat_{r}")
+        result = train_eval_one(task, artifacts, sampling_config)
+        
+        if len(result.predictions) == 0:
+            continue
+        
+        all_predictions.append(result.predictions)
+        
+        # Top-K selection
+        top_k_idx = np.argsort(result.predictions)[-top_k:]
+        top_k_set = set(test_idx[top_k_idx])
+        all_top_k_sets.append(top_k_set)
+        
+        # Portfolio return
+        if ret_fwd is not None:
+            top_k_returns = ret_fwd[top_k_idx]
+            port_ret = np.nanmean(np.clip(top_k_returns, -0.5, 1.0))
+            all_portfolio_returns.append(port_ret)
+        
+        # Compute pairwise Jaccard for current repeats
+        jaccards = []
+        for i in range(len(all_top_k_sets)):
+            for j in range(i+1, len(all_top_k_sets)):
+                jaccards.append(compute_jaccard(all_top_k_sets[i], all_top_k_sets[j]))
+        
+        # Check sequential stopping
+        if r >= min_repeats - 1 and check_convergence(jaccards, all_portfolio_returns):
+            log(f"  Converged at R={r+1} repeats")
+            break
+    
+    # Final stability metrics
+    n_repeats = len(all_predictions)
+    
+    # Jaccard metrics
+    all_jaccards = []
+    for i in range(n_repeats):
+        for j in range(i+1, n_repeats):
+            all_jaccards.append(compute_jaccard(all_top_k_sets[i], all_top_k_sets[j]))
+    
+    mean_jaccard = np.mean(all_jaccards) if all_jaccards else 0.0
+    std_jaccard = np.std(all_jaccards) if all_jaccards else 0.0
+    
+    # Probability stability (per-position std across repeats)
+    if n_repeats >= 2:
+        pred_matrix = np.vstack(all_predictions)
+        prob_std_per_name = pred_matrix.std(axis=0)
+        mean_prob_std = prob_std_per_name.mean()
+        
+        # KS statistic between first and last repeat distributions
+        ks_stat, ks_pval = stats.ks_2samp(all_predictions[0], all_predictions[-1])
+        
+        # PSI (Population Stability Index) - binned distribution comparison
+        def compute_psi(expected, actual, bins=10):
+            """Compute PSI between two probability distributions."""
+            min_val, max_val = 0.0, 1.0
+            bin_edges = np.linspace(min_val, max_val, bins + 1)
+            exp_counts = np.histogram(expected, bins=bin_edges)[0] + 1  # Add 1 to avoid log(0)
+            act_counts = np.histogram(actual, bins=bin_edges)[0] + 1
+            exp_pct = exp_counts / exp_counts.sum()
+            act_pct = act_counts / act_counts.sum()
+            psi = np.sum((act_pct - exp_pct) * np.log(act_pct / exp_pct))
+            return psi
+        
+        psi_value = compute_psi(all_predictions[0], all_predictions[-1])
+        
+        # ECE (Expected Calibration Error) - uses first repeat's predictions
+        def compute_ece(probs, labels, n_bins=10):
+            """Compute Expected Calibration Error."""
+            bin_edges = np.linspace(0, 1, n_bins + 1)
+            ece = 0.0
+            for i in range(n_bins):
+                mask = (probs >= bin_edges[i]) & (probs < bin_edges[i+1])
+                if mask.sum() > 0:
+                    bin_prob = probs[mask].mean()
+                    bin_acc = labels[mask].mean()
+                    ece += mask.sum() * abs(bin_prob - bin_acc)
+            return ece / len(probs)
+        
+        # Get labels for ECE
+        y = artifacts.y_by_horizon.get(horizon, np.array([]))
+        if len(y) > 0:
+            y_test = y[test_idx]
+            ece_value = compute_ece(all_predictions[0], y_test)
+        else:
+            ece_value = np.nan
+    else:
+        mean_prob_std = 0.0
+        ks_stat, ks_pval = 0.0, 1.0
+        psi_value = 0.0
+        ece_value = np.nan
+    
+    # Rank stability (Spearman correlation between first and last repeat)
+    if n_repeats >= 2:
+        spearman_corr, _ = stats.spearmanr(all_predictions[0], all_predictions[-1])
+    else:
+        spearman_corr = 1.0
+    
+    # Returns stability + Path metrics
+    if all_portfolio_returns:
+        mean_port_return = np.mean(all_portfolio_returns)
+        std_port_return = np.std(all_portfolio_returns)
+        
+        # Sharpe ratio (annualized from quarterly)
+        if std_port_return > 0:
+            sharpe_ratio = (mean_port_return * 4) / (std_port_return * 2)  # Annualize
+        else:
+            sharpe_ratio = np.nan
+        
+        # Max drawdown (across repeats' cumulative paths)
+        cum_returns = np.cumprod(1 + np.array(all_portfolio_returns))
+        running_max = np.maximum.accumulate(cum_returns)
+        drawdowns = (cum_returns - running_max) / running_max
+        max_drawdown = drawdowns.min() if len(drawdowns) > 0 else 0.0
+        
+        # Hit rate (% of positive returns)
+        hit_rate = np.mean(np.array(all_portfolio_returns) > 0)
+    else:
+        mean_port_return = np.nan
+        std_port_return = np.nan
+        sharpe_ratio = np.nan
+        max_drawdown = np.nan
+        hit_rate = np.nan
+    
+    report = {
+        "quarter": quarter,
+        "horizon": horizon,
+        "n_repeats": n_repeats,
+        # Rank stability
+        "mean_jaccard_at_k": mean_jaccard,
+        "std_jaccard_at_k": std_jaccard,
+        "jaccard_ci_half_width": 1.96 * std_jaccard / np.sqrt(max(1, len(all_jaccards))),
+        "spearman_first_last": spearman_corr,
+        # Probability stability
+        "mean_prob_std": mean_prob_std,
+        "ks_statistic": ks_stat,
+        "ks_pvalue": ks_pval,
+        "psi": psi_value,
+        "ece": ece_value,
+        # Returns / Strategy stability
+        "mean_portfolio_return": mean_port_return,
+        "std_portfolio_return": std_port_return,
+        "return_ci_half_width": 1.96 * std_port_return / np.sqrt(max(1, n_repeats)) if not np.isnan(std_port_return) else np.nan,
+        "sharpe_ratio": sharpe_ratio,
+        "max_drawdown": max_drawdown,
+        "hit_rate": hit_rate,
+    }
+    
+    log(f"  Stability: Jaccard@{top_k}={mean_jaccard:.2%}, Spearman={spearman_corr:.3f}, "
+        f"KS={ks_stat:.3f}, PSI={psi_value:.3f}, ECE={ece_value:.3f if not np.isnan(ece_value) else 'N/A'}")
+    log(f"  Returns: Mean={mean_port_return:.2%}, Sharpe={sharpe_ratio:.2f if not np.isnan(sharpe_ratio) else 'N/A'}, "
+        f"MaxDD={max_drawdown:.2%}, HitRate={hit_rate:.1%}")
+    
+    TIMING_LOGGER.log_phase(
+        "stability_aggregate",
+        quarter=quarter,
+        horizon_mo=horizon,
+        n_repeats=n_repeats,
+        mean_jaccard=mean_jaccard,
+        spearman=spearman_corr,
+        ks_stat=ks_stat,
+        psi=psi_value,
+        ece=ece_value,
+        sharpe=sharpe_ratio
+    )
+    
+    return report
+
+# ================================================
+# SPY BENCHMARK (ROBUST)
+# ================================================
+
+def get_spy_quarterly_returns(start_date, end_date, fail_fast=True):
+    """
+    Get SPY quarterly returns with validation.
+    
+    If any quarter is missing/NaN and fail_fast=True, raises error.
+    """
+    log("Fetching SPY quarterly returns...")
+    
+    try:
+        spy = yf.download("SPY", start=start_date, end=end_date, progress=False)
+        
+        if spy.empty:
+            if fail_fast:
+                raise ValueError("SPY data download returned empty DataFrame")
+            return {}
+        
+        # Handle multi-level columns from yfinance
+        if isinstance(spy.columns, pd.MultiIndex):
+            spy.columns = spy.columns.get_level_values(0)
+        
+        # Resample to quarterly
+        spy_q = spy["Close"].resample("QE").last().pct_change()
+        spy_q.index = spy_q.index.to_period("Q")
+        spy_map = spy_q.to_dict()
+        
+        # Validate no NaN
+        nan_quarters = [q for q, v in spy_map.items() if pd.isna(v)]
+        if nan_quarters and fail_fast:
+            raise ValueError(f"SPY returns missing for quarters: {nan_quarters[:5]}...")
+        
+        log(f"  Loaded SPY returns for {len(spy_map)} quarters")
+        return spy_map
+        
+    except Exception as e:
+        if fail_fast:
+            raise ValueError(f"SPY benchmark failed: {e}")
+        log(f"[WARN] SPY fetch failed: {e}")
+        return {}
+
+log("✅ Cell A1 Complete: Compile-Once Infrastructure Defined.")
 
 # %% [markdown]
 # # Cell A2: Extend Deals Data (FactSet Batches 2000-2025)
@@ -579,6 +1455,11 @@ def load_deals_robust(config, preloaded_df=None, tic_map=None, name_map=None):
     3. Name Mapping validation (FactSet rescue fallback).
     4. Numeric CIK enforcement.
     5. Duplicate column prevention.
+    6. Per-quarter dropped-deal tracking (R5.D compliance).
+    
+    Returns:
+        Tuple[pd.DataFrame, Dict]: (deals_df, dropped_deals_stats)
+        dropped_deals_stats has keys: 'by_quarter', 'total', 'coverage_by_quarter'
     """
     if preloaded_df is not None and not preloaded_df.empty:
         log(f"Using preloaded deals dataframe ({len(preloaded_df)} rows)...")
@@ -703,16 +1584,41 @@ def load_deals_robust(config, preloaded_df=None, tic_map=None, name_map=None):
                  log(f"  Name Map Filled {filled} CIKs.")
 
     # --- Common Cleanup ---
+    # Track dropped deals per quarter BEFORE dropping (R5.D)
+    dropped_deals_stats = {"by_quarter": {}, "total": 0, "coverage_by_quarter": {}}
+    
     if "cik" in df.columns:
         df["cik"] = pd.to_numeric(df["cik"], errors="coerce").astype("Int64")
+        
+        # Track per-quarter drops before removal
+        if "ann_date" in df.columns:
+            df["_temp_ann_date"] = pd.to_datetime(df["ann_date"], errors="coerce")
+            missing_cik_mask = df["cik"].isna()
+            
+            # Count drops by quarter
+            for idx in df[missing_cik_mask].index:
+                ann = df.loc[idx, "_temp_ann_date"]
+                if pd.notna(ann):
+                    q_key = f"{ann.year}Q{(ann.month-1)//3 + 1}"
+                    dropped_deals_stats["by_quarter"][q_key] = dropped_deals_stats["by_quarter"].get(q_key, 0) + 1
+            
+            # Coverage rate per quarter (before dropping)
+            for q_key, grp in df.groupby(df["_temp_ann_date"].dt.to_period("Q").astype(str)):
+                total_in_q = len(grp)
+                valid_in_q = grp["cik"].notna().sum()
+                dropped_deals_stats["coverage_by_quarter"][q_key] = valid_in_q / total_in_q if total_in_q > 0 else 0.0
+            
+            df.drop(columns=["_temp_ann_date"], inplace=True)
+        
         initial_len = len(df)
         df.dropna(subset=["cik"], inplace=True)
         dropped = initial_len - len(df)
+        dropped_deals_stats["total"] = dropped
         if dropped > 0:
             log(f"[WARN] Dropped {dropped} deals due to missing/invalid CIK.")
     else:
         log("[ERROR] No CIK column found. Dropping ALL deals.")
-        return pd.DataFrame(columns=["cik", "ann_date", "_deal_value_num", "_deal_value_log"])
+        return pd.DataFrame(columns=["cik", "ann_date", "_deal_value_num", "_deal_value_log"]), dropped_deals_stats
     
     if "ann_date" in df.columns:
         # Check for duplicates (if multiple cols mapped to ann_date?)
@@ -744,7 +1650,7 @@ def load_deals_robust(config, preloaded_df=None, tic_map=None, name_map=None):
     if "ann_date" in out.columns:
         out = out.sort_values("ann_date").reset_index(drop=True)
         
-    return out
+    return out, dropped_deals_stats
 
 # Build Ticker -> CIK map from Compustat (panel_clean)
 # This allows us to link FactSet deals (which have Tickers) to CIKs
@@ -772,7 +1678,7 @@ if "tic" in panel_clean.columns and "cik" in panel_clean.columns:
     log(f"Generated Ticker-CIK map with {len(TIC_MAP)} entries.")
     log(f"Generated Name-CIK map with {len(NAME_MAP)} entries.")
 
-deals_df = load_deals_robust(CONFIG, preloaded_df=DEALS_DF, tic_map=TIC_MAP, name_map=NAME_MAP)
+deals_df, DROPPED_DEALS_STATS = load_deals_robust(CONFIG, preloaded_df=DEALS_DF, tic_map=TIC_MAP, name_map=NAME_MAP)\r\nlog(f\"  Dropped deals tracking: {DROPPED_DEALS_STATS['total']} total, {len(DROPPED_DEALS_STATS['by_quarter'])} quarters affected\")
 
 # Save
 deals_path = os.path.join(ARTIFACT_DIR, "deals.parquet")
@@ -1035,6 +1941,234 @@ print("\nLabel Coverage by Year:")
 print(cov_report.tail(5))
 
 # %% [markdown]
+# # Cell E2: COMPILE Phase - Convert to Global Arrays
+#
+# **Goal**: Convert the labeled panel DataFrame to CompileArtifacts (float32 numpy arrays).
+# This is the COMPILE phase that should only run once per input configuration.
+# The resulting artifacts can be reused for all training runs.
+
+# %%
+def compile_global_arrays(panel_df, feature_cols, horizons_months, config, dropped_deals_stats=None):
+    """
+    COMPILE PHASE: Convert labeled panel to global numpy arrays for fast training.
+    
+    This function produces:
+    - X_global: float32 design matrix (no NaN, no string columns)
+    - y_by_horizon: dict of uint8 label arrays per horizon
+    - rows_train_by_quarter / rows_test_by_quarter: precomputed splits
+    - metadata arrays: gvkey, cik, datadate, ret_fwd
+    
+    CRITICAL: This is the ONLY place where DataFrame -> Array conversion happens.
+    All subsequent training must use array slicing only.
+    """
+    log("=" * 60)
+    log("COMPILE PHASE: Converting Panel to Global Arrays")
+    log("=" * 60)
+    
+    t_start = time.time()
+    rss_before = get_rss_mb()
+    
+    # 1. Compute cache key
+    cache_key = compute_compile_cache_key(config)
+    log(f"Cache key: {cache_key}")
+    
+    # 2. Check for cached artifacts
+    cache_dir = os.path.join(ARTIFACT_DIR, "compile_cache")
+    manifest_path = os.path.join(cache_dir, "compile_manifest.json")
+    
+    if not config.get("compile", {}).get("force_recompile", False) and os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+            
+            if manifest.get("cache_key") == cache_key:
+                log("Cache key matches - loading cached artifacts...")
+                
+                # Load cached arrays
+                X_global = np.load(os.path.join(cache_dir, "X_global.npy"), 
+                                   mmap_mode='r' if config.get("compile", {}).get("use_memmap", True) else None)
+                
+                with open(os.path.join(cache_dir, "feature_names.json"), "r") as f:
+                    feature_names = json.load(f)
+                
+                y_by_horizon = {}
+                for h_mo in horizons_months:
+                    y_path = os.path.join(cache_dir, f"y_{h_mo}m.npy")
+                    if os.path.exists(y_path):
+                        y_by_horizon[h_mo] = np.load(y_path)
+                
+                quarter_ids = np.load(os.path.join(cache_dir, "quarter_ids.npy"), allow_pickle=True)
+                
+                train_npz = np.load(os.path.join(cache_dir, "rows_train_by_quarter.npz"))
+                test_npz = np.load(os.path.join(cache_dir, "rows_test_by_quarter.npz"))
+                rows_train = {k: train_npz[k] for k in train_npz.files}
+                rows_test = {k: test_npz[k] for k in test_npz.files}
+                
+                metadata_gvkey = np.load(os.path.join(cache_dir, "metadata_gvkey.npy"), allow_pickle=True)
+                metadata_cik = np.load(os.path.join(cache_dir, "metadata_cik.npy"))
+                metadata_ret_fwd = np.load(os.path.join(cache_dir, "metadata_ret_fwd.npy"))
+                
+                log(f"✅ CACHE HIT: Loaded {manifest['n_rows']} rows, {manifest['n_features']} features in {time.time()-t_start:.1f}s")
+                
+                TIMING_LOGGER.log_phase(
+                    "compile",
+                    cache_hit=True,
+                    n_rows=manifest["n_rows"],
+                    n_features=manifest["n_features"],
+                    total_seconds=time.time() - t_start
+                )
+                
+                return CompileArtifacts(
+                    X_global=X_global,
+                    feature_names=feature_names,
+                    y_by_horizon=y_by_horizon,
+                    quarter_ids=quarter_ids,
+                    rows_train_by_quarter=rows_train,
+                    rows_test_by_quarter=rows_test,
+                    metadata_gvkey=metadata_gvkey,
+                    metadata_cik=metadata_cik,
+                    metadata_datadate=None,
+                    metadata_ret_fwd=metadata_ret_fwd,
+                    cache_key=cache_key,
+                    cache_hit=True,
+                    compile_seconds=time.time() - t_start,
+                    n_rows=manifest["n_rows"],
+                    n_features=manifest["n_features"]
+                )
+        except Exception as e:
+            log(f"[WARN] Cache load failed: {e}, recompiling...")
+    
+    # 3. Full compile
+    log("Compiling from scratch...")
+    
+    # Ensure we have at least basic features
+    available_feats = [c for c in feature_cols if c in panel_df.columns]
+    if len(available_feats) < 5:
+        log(f"[WARN] Only {len(available_feats)} features found in panel")
+    
+    # Convert to float32 array
+    X_data = panel_df[available_feats].values.astype(np.float32)
+    np.nan_to_num(X_data, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    log(f"  X_global: {X_data.shape} ({X_data.nbytes / 1e6:.1f} MB)")
+    
+    # Labels by horizon
+    y_by_horizon = {}
+    for h_mo in horizons_months:
+        label_col = f"label_deal_0_{h_mo}m"
+        if label_col in panel_df.columns:
+            y_by_horizon[h_mo] = panel_df[label_col].values.astype(np.uint8)
+            log(f"  y_{h_mo}m: {y_by_horizon[h_mo].sum()} positives")
+    
+    # Quarter IDs
+    quarter_ids = panel_df["panel_q"].values
+    quarters = sorted(panel_df["panel_q"].unique())
+    log(f"  Quarters: {len(quarters)} ({quarters[0]} to {quarters[-1]})")
+    
+    # Compute splits (expanding window: train on all rows before quarter)
+    rows_train = {}
+    rows_test = {}
+    panel_idx = np.arange(len(panel_df), dtype=np.int32)
+    
+    for q in quarters:
+        test_mask = quarter_ids == q
+        train_mask = quarter_ids < q  # Expanding window
+        
+        rows_test[q] = panel_idx[test_mask]
+        rows_train[q] = panel_idx[train_mask]
+    
+    log(f"  Computed splits for {len(quarters)} quarters")
+    
+    # Metadata
+    metadata_gvkey = panel_df["gvkey"].values if "gvkey" in panel_df.columns else np.array([])
+    metadata_cik = pd.to_numeric(panel_df["cik"], errors="coerce").fillna(-1).values.astype(np.int64)
+    
+    if "ret_fwd_1q" in panel_df.columns:
+        metadata_ret_fwd = panel_df["ret_fwd_1q"].values.astype(np.float32)
+        np.nan_to_num(metadata_ret_fwd, copy=False, nan=0.0)
+    else:
+        metadata_ret_fwd = np.zeros(len(panel_df), dtype=np.float32)
+    
+    # 4. Save to cache
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    np.save(os.path.join(cache_dir, "X_global.npy"), X_data)
+    
+    with open(os.path.join(cache_dir, "feature_names.json"), "w") as f:
+        json.dump(available_feats, f)
+    
+    for h_mo, y in y_by_horizon.items():
+        np.save(os.path.join(cache_dir, f"y_{h_mo}m.npy"), y)
+    
+    np.save(os.path.join(cache_dir, "quarter_ids.npy"), quarter_ids, allow_pickle=True)
+    np.savez(os.path.join(cache_dir, "rows_train_by_quarter.npz"), **rows_train)
+    np.savez(os.path.join(cache_dir, "rows_test_by_quarter.npz"), **rows_test)
+    np.save(os.path.join(cache_dir, "metadata_gvkey.npy"), metadata_gvkey, allow_pickle=True)
+    np.save(os.path.join(cache_dir, "metadata_cik.npy"), metadata_cik)
+    np.save(os.path.join(cache_dir, "metadata_ret_fwd.npy"), metadata_ret_fwd)
+    
+    # Manifest
+    compile_seconds = time.time() - t_start
+    manifest = {
+        "cache_key": cache_key,
+        "compile_timestamp": datetime.now().isoformat(),
+        "compile_seconds": compile_seconds,
+        "n_rows": len(panel_df),
+        "n_features": len(available_feats),
+        "horizons_months": list(horizons_months),
+        "n_quarters": len(quarters),
+        "rss_before_mb": rss_before,
+        "rss_after_mb": get_rss_mb(),
+    }
+    
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    
+    TIMING_LOGGER.log_phase(
+        "compile",
+        cache_hit=False,
+        n_rows=len(panel_df),
+        n_features=len(available_feats),
+        total_seconds=compile_seconds
+    )
+    
+    log(f"✅ COMPILE COMPLETE: {len(panel_df)} rows, {len(available_feats)} features in {compile_seconds:.1f}s")
+    log("=" * 60)
+    
+    return CompileArtifacts(
+        X_global=X_data,
+        feature_names=available_feats,
+        y_by_horizon=y_by_horizon,
+        quarter_ids=quarter_ids,
+        rows_train_by_quarter=rows_train,
+        rows_test_by_quarter=rows_test,
+        metadata_gvkey=metadata_gvkey,
+        metadata_cik=metadata_cik,
+        metadata_datadate=None,
+        metadata_ret_fwd=metadata_ret_fwd,
+        dropped_deals_by_quarter=dropped_deals_stats.get("by_quarter", {}) if dropped_deals_stats else {},
+        coverage_rate_by_quarter=dropped_deals_stats.get("coverage_by_quarter", {}) if dropped_deals_stats else {},
+        cache_key=cache_key,
+        cache_hit=False,
+        compile_seconds=compile_seconds,
+        n_rows=len(panel_df),
+        n_features=len(available_feats)
+    )
+
+# Run Compile Phase
+COMPILE_ARTIFACTS = compile_global_arrays(
+    labeled_panel, 
+    final_feats,  # Feature columns from Cell D
+    CONFIG["horizons_months"],
+    CONFIG,
+    dropped_deals_stats=DROPPED_DEALS_STATS
+)
+
+log(f"✅ Cell E2 Complete: Compiled {COMPILE_ARTIFACTS.n_rows} rows, {COMPILE_ARTIFACTS.n_features} features")
+if COMPILE_ARTIFACTS.cache_hit:
+    log("  (Used cached compile artifacts)")
+
+
+# %% [markdown]
 # # Cell F: Training Dry-Run Harness (Stability)
 #
 # **Goal**: Verify model stability by running multiple trials on a single holdout quarter. Measure Jaccard overlap of top predictions.
@@ -1121,135 +2255,253 @@ def dry_run_harness(df, target_col, n_trials=5, top_k=50):
     
     return pd.DataFrame(results), mean_jaccard
 
-# Prepare quarter column
 # Prepare quarter column - Always do this, needed for Cell G too
 labeled_panel["panel_q"] = labeled_panel["datadate"].dt.to_period("Q")
 
-# Run Dry Run with Resume Logic
-dry_path = os.path.join(ARTIFACT_DIR, "dry_run_results.json")
+# Run Stability Suite with COMPILE_ARTIFACTS (NEW)
+stability_path = os.path.join(ARTIFACT_DIR, "stability_report.json")
 
-if AUTO_RESUME and os.path.exists(dry_path):
-    log(f"♻️ RESUMING: Found existing dry run results at {dry_path}")
-    with open(dry_path, "r") as f:
-         dry_res = pd.DataFrame(json.load(f))
-    stability_score = 0.0 # Placeholder
+if AUTO_RESUME and os.path.exists(stability_path):
+    log(f"♻️ RESUMING: Found existing stability report at {stability_path}")
+    with open(stability_path, "r") as f:
+        stability_report = json.load(f)
+    stability_score = stability_report.get("mean_jaccard_at_k", 0.0)
 else:
-    dry_res, stability_score = dry_run_harness(labeled_panel, "label_deal_0_3m", n_trials=CONFIG["calibration"]["n_dryrun_trials"])
-    with open(dry_path, "w") as f:
-        json.dump(dry_res.to_dict('records'), f, indent=4) # Convert DataFrame to list of dicts for JSON saving
-    log(f"✅ Cell F Complete. Stability Score: {stability_score:.2f}")
+    # Select holdout quarter (last quarter with sufficient positives)
+    quarters = sorted(COMPILE_ARTIFACTS.rows_test_by_quarter.keys())
+    # Pick 5th from end to ensure data settlement
+    holdout_q = quarters[-5] if len(quarters) > 5 else quarters[-1]
+    
+    log(f"Running Stability Suite on holdout quarter: {holdout_q}")
+    stability_report = run_stability_suite(
+        quarter=holdout_q,
+        horizon=3,  # Default to 3-month horizon
+        artifacts=COMPILE_ARTIFACTS,
+        stability_config=CONFIG["stability"],
+        sampling_config=CONFIG["sampling"]
+    )
+    
+    # Save report
+    with open(stability_path, "w") as f:
+        json.dump(stability_report, f, indent=2, default=str)
+    
+    stability_score = stability_report.get("mean_jaccard_at_k", 0.0)
+    log(f"✅ Cell F Complete. Stability Score (Jaccard@50): {stability_score:.2%}")
+
+# Also run legacy dry-run harness for comparison if not using inner-loop mode
+if not CONFIG["inner_loop"]["enabled"]:
+    dry_path = os.path.join(ARTIFACT_DIR, "dry_run_results.json")
+    
+    if AUTO_RESUME and os.path.exists(dry_path):
+        log(f"♻️ RESUMING: Found existing dry run results at {dry_path}")
+        with open(dry_path, "r") as f:
+             dry_res = pd.DataFrame(json.load(f))
+    else:
+        dry_res, legacy_jaccard = dry_run_harness(labeled_panel, "label_deal_0_3m", n_trials=CONFIG["calibration"]["n_dryrun_trials"])
+        with open(dry_path, "w") as f:
+            json.dump(dry_res.to_dict('records'), f, indent=4)
+        log(f"  Legacy dry run Jaccard: {legacy_jaccard:.2%}")
+
 
 # %% [markdown]
 # # Cell G: Full Backtest & Baselines + Visuals
 #
 # **Goal**: Expanding window backtest comparisons vs S&P 500.
+#
+# **INNER LOOP MODE**: Set CONFIG["inner_loop"]["enabled"] = True to run only 1 quarter
+# for fast development iteration (target: ≤60 seconds).
 
 # %%
 # 1. Basics
 TARGET_HORIZON = "label_deal_0_3m"
+TARGET_HORIZON_MONTHS = 3
 
-# 2. S&P 500 Baseline (yfinance)
-log("Fetching S&P 500 (SPY) data...")
-start_date = labeled_panel["datadate"].min().strftime("%Y-%m-%d")
-end_date = datetime.now().strftime("%Y-%m-%d")
-
-try:
-    spy = yf.download("SPY", start=start_date, end=end_date, progress=False)
-    # Resample to Quarterly Returns
-    spy_q = spy["Close"].resample("Q").last().pct_change()
-    # Align to panel quarters
-    spy_q.index = spy_q.index.to_period("Q")
-    spy_map = spy_q.to_dict()
-    log(f"Loaded SPY data. Quarters covered: {len(spy_map)}")
-except Exception as e:
-    log(f"[WARN] Failed to load SPY: {e}. Using dummy baseline.")
-    spy_map = {}
-
-# 3. Expanding Window Loop
-quarters = sorted(labeled_panel["panel_q"].unique())
-start_idx = 10 # Burn-in
-results_backtest = []
-
-X_cols = [c for c in labeled_panel.columns if c in final_feats]
-
-log(f"Starting Backtest over {len(quarters)-start_idx} quarters...")
-
-for q_idx in range(start_idx, len(quarters)):
-    q = quarters[q_idx]
+# ================================================
+# INNER LOOP MODE (Fast Development)
+# ================================================
+if CONFIG["inner_loop"]["enabled"]:
+    log("=" * 60)
+    log("⚡ INNER LOOP MODE: Fast single-quarter iteration")
+    log("=" * 60)
     
-    # Train window: < q
-    train_mask = labeled_panel["panel_q"] < q
-    test_mask = labeled_panel["panel_q"] == q
+    t_inner_start = time.time()
     
-    train = labeled_panel[train_mask]
-    test = labeled_panel[test_mask]
+    # Pick quarter
+    quarters = sorted(COMPILE_ARTIFACTS.rows_test_by_quarter.keys())
+    inner_q = CONFIG["inner_loop"]["quarter"]
+    if inner_q is None:
+        inner_q = quarters[-5] if len(quarters) > 5 else quarters[-1]
     
-    if len(test) == 0: continue
-    if train[TARGET_HORIZON].sum() < 10: continue # Skip if no training signal
+    inner_horizon = CONFIG["inner_loop"]["horizon"]
+    log(f"  Quarter: {inner_q}, Horizon: {inner_horizon}m")
     
-    # Downsample train
-    pos = train[train[TARGET_HORIZON]==1]
-    neg = train[train[TARGET_HORIZON]==0].sample(n=len(pos)*10, random_state=42)
-    train_bal = pd.concat([pos, neg])
+    # Run single train_eval_one
+    task = TrainTask(quarter=inner_q, horizon_months=inner_horizon, seed=42)
+    result = train_eval_one(task, COMPILE_ARTIFACTS, CONFIG["sampling"])
     
-    # Train
-    clf = HistGradientBoostingClassifier(learning_rate=0.05, max_depth=4, random_state=42)
-    clf.fit(train_bal[X_cols], train_bal[TARGET_HORIZON])
+    inner_elapsed = time.time() - t_inner_start
+    log(f"  AUC: {result.metrics.get('auc', 0.5):.3f}")
+    log(f"  Total time: {inner_elapsed:.1f}s (target: ≤60s)")
+    log(f"  Timing breakdown: {result.timing}")
     
-    # Predict
-    probs = clf.predict_proba(test[X_cols])[:, 1]
+    if inner_elapsed <= 60:
+        log("✅ INNER LOOP PASSED: ≤60 seconds")
+    else:
+        log(f"⚠️ INNER LOOP SLOW: {inner_elapsed:.1f}s > 60s target")
     
-    # Evaluate Strategy
-    # Select Top 50
-    top_50_idx = np.argsort(probs)[-50:]
-    selected = test.iloc[top_50_idx].copy()
+    # Run AutoML if requested
+    if CONFIG.get("automl", {}).get("enabled_inner_loop", False):
+        best_config, preds, trials = run_one_shot_automl(
+            inner_q, inner_horizon, COMPILE_ARTIFACTS,
+            CONFIG["automl"], CONFIG["sampling"]
+        )
+        log(f"  AutoML best config: {best_config}")
     
-    # Returns (fwd 1q)
-    port_ret = selected["ret_fwd_1q"].clip(-0.5, 1.0).mean() # Clip outliers
+    log("=" * 60)
+    log("⚡ Inner loop complete. Set CONFIG['inner_loop']['enabled'] = False for full backtest.")
+    log("=" * 60)
     
-    # Baselines
-    univ_ret = test["ret_fwd_1q"].clip(-0.5, 1.0).mean()
-    spy_ret = spy_map.get(q, np.nan)
-    if isinstance(spy_ret, pd.Series): spy_ret = spy_ret.item() # Handle yfinance multi-index quirk
+    # Skip rest of Cell G in inner loop mode
+    results_backtest = []
+    res_df = pd.DataFrame()
     
-    # Stats
-    try:
-        auc_score = roc_auc_score(test[TARGET_HORIZON], probs)
-    except:
-        auc_score = 0.5
+else:
+    # ================================================
+    # FULL BACKTEST MODE
+    # ================================================
+    
+    # 2. S&P 500 Baseline (use robust function)
+    start_date = labeled_panel["datadate"].min().strftime("%Y-%m-%d")
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    
+    spy_map = get_spy_quarterly_returns(
+        start_date, end_date, 
+        fail_fast=CONFIG.get("benchmark", {}).get("spy_fail_fast", False)
+    )
+    
+    # 3. Decide: Fast mode (COMPILE_ARTIFACTS) or Legacy mode (DataFrame)
+    USE_FAST_BACKTEST = True  # Use new train_eval_one
+    
+    quarters = sorted(COMPILE_ARTIFACTS.rows_test_by_quarter.keys())
+    start_idx = 10  # Burn-in
+    results_backtest = []
+    
+    log(f"Starting Backtest over {len(quarters)-start_idx} quarters (fast_mode={USE_FAST_BACKTEST})...")
+    t_backtest_start = time.time()
+    
+    for q_idx, q in enumerate(quarters[start_idx:], start=start_idx):
         
-    results_backtest.append({
-        "quarter": str(q),
-        "auc": auc_score,
-        "port_ret": port_ret,
-        "univ_ret": univ_ret,
-        "spy_ret": spy_ret,
-        "excess_vs_spy": (port_ret - spy_ret) if pd.notna(spy_ret) else np.nan
-    })
+        if USE_FAST_BACKTEST:
+            # FAST PATH: Use train_eval_one with array slicing
+            task = TrainTask(quarter=q, horizon_months=TARGET_HORIZON_MONTHS, seed=42)
+            result = train_eval_one(task, COMPILE_ARTIFACTS, CONFIG["sampling"])
+            
+            if len(result.predictions) == 0:
+                continue
+            
+            probs = result.predictions
+            test_idx = COMPILE_ARTIFACTS.rows_test_by_quarter[q]
+            
+            # Top 50 selection
+            top_50_idx = np.argsort(probs)[-50:]
+            ret_fwd = COMPILE_ARTIFACTS.metadata_ret_fwd[test_idx]
+            port_ret = np.clip(ret_fwd[top_50_idx], -0.5, 1.0).mean()
+            univ_ret = np.clip(ret_fwd, -0.5, 1.0).mean()
+            
+            auc_score = result.metrics.get("auc", 0.5)
+            
+        else:
+            # LEGACY PATH: Use DataFrame-based training (for comparison)
+            X_cols = [c for c in labeled_panel.columns if c in final_feats]
+            
+            train_mask = labeled_panel["panel_q"] < q
+            test_mask = labeled_panel["panel_q"] == q
+            
+            train = labeled_panel[train_mask]
+            test = labeled_panel[test_mask]
+            
+            if len(test) == 0: 
+                continue
+            if train[TARGET_HORIZON].sum() < 10: 
+                continue
+            
+            # Downsample train
+            pos = train[train[TARGET_HORIZON]==1]
+            neg = train[train[TARGET_HORIZON]==0].sample(n=min(len(pos)*10, len(train[train[TARGET_HORIZON]==0])), random_state=42)
+            train_bal = pd.concat([pos, neg])
+            
+            # Train
+            clf = HistGradientBoostingClassifier(learning_rate=0.05, max_depth=4, random_state=42)
+            clf.fit(train_bal[X_cols], train_bal[TARGET_HORIZON])
+            
+            # Predict
+            probs = clf.predict_proba(test[X_cols])[:, 1]
+            
+            # Top 50
+            top_50_idx = np.argsort(probs)[-50:]
+            selected = test.iloc[top_50_idx].copy()
+            
+            port_ret = selected["ret_fwd_1q"].clip(-0.5, 1.0).mean() if "ret_fwd_1q" in selected.columns else 0.0
+            univ_ret = test["ret_fwd_1q"].clip(-0.5, 1.0).mean() if "ret_fwd_1q" in test.columns else 0.0
+            
+            try:
+                auc_score = roc_auc_score(test[TARGET_HORIZON], probs)
+            except:
+                auc_score = 0.5
+        
+        # SPY return for this quarter
+        spy_ret = spy_map.get(q, np.nan)
+        if isinstance(spy_ret, pd.Series): 
+            spy_ret = spy_ret.item()
+        
+        results_backtest.append({
+            "quarter": str(q),
+            "auc": auc_score,
+            "port_ret": port_ret,
+            "univ_ret": univ_ret,
+            "spy_ret": spy_ret,
+            "excess_vs_spy": (port_ret - spy_ret) if pd.notna(spy_ret) else np.nan
+        })
+        
+        if q_idx % 4 == 0:
+            log(f"Q {q}: AUC={auc_score:.2f}, Port={port_ret:.1%}, SPY={spy_ret if pd.notna(spy_ret) else 'N/A'}")
     
-    if q_idx % 4 == 0:
-        log(f"Q {q}: AUC={auc_score:.2f}, Port={port_ret:.1%}, SPY={spy_ret:.1%}")
+    backtest_elapsed = time.time() - t_backtest_start
+    log(f"Backtest complete in {backtest_elapsed:.1f}s ({len(results_backtest)} quarters)")
+    
+    TIMING_LOGGER.log_phase(
+        "backtest",
+        n_quarters=len(results_backtest),
+        total_seconds=backtest_elapsed,
+        fast_mode=USE_FAST_BACKTEST
+    )
+    
+    res_df = pd.DataFrame(results_backtest)
+    res_path = os.path.join(ARTIFACT_DIR, "results_backtest.parquet")
+    res_df.to_parquet(res_path)
+    
+    # 4. Visuals (Equity Curve)
+    if len(res_df) > 0:
+        res_df_plot = res_df.fillna(0)
+        res_df_plot["cum_port"] = (1 + res_df_plot["port_ret"]).cumprod()
+        res_df_plot["cum_spy"] = (1 + res_df_plot["spy_ret"]).cumprod()
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(res_df_plot["quarter"], res_df_plot["cum_port"], label="Model Strategy", linewidth=2.5)
+        plt.plot(res_df_plot["quarter"], res_df_plot["cum_spy"], label="S&P 500", linestyle="--", color="gray")
+        plt.title("Cumulative Wealth: Model vs S&P 500")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(os.path.join(ARTIFACT_DIR, "equity_curve.png"), dpi=100)
+        plt.show()
+    
+    log("✅ Cell G Complete. Backtest finished.")
 
-res_df = pd.DataFrame(results_backtest)
-res_path = os.path.join(ARTIFACT_DIR, "results_backtest.parquet")
-res_df.to_parquet(res_path)
+# Save timing log
+TIMING_LOGGER.save()
 
-# 4. Visuals (Equity Curve)
-# Fillna with 0 for plotting
-res_df_plot = res_df.fillna(0)
-res_df_plot["cum_port"] = (1 + res_df_plot["port_ret"]).cumprod()
-res_df_plot["cum_spy"] = (1 + res_df_plot["spy_ret"]).cumprod()
-
-plt.figure(figsize=(10, 6))
-plt.plot(res_df_plot["quarter"], res_df_plot["cum_port"], label="Model Strategy", linewidth=2.5)
-plt.plot(res_df_plot["quarter"], res_df_plot["cum_spy"], label="S&P 500", linestyle="--", color="gray")
-plt.title("Cumulative Wealth: Model vs S&P 500")
-plt.grid(True, alpha=0.3)
-plt.legend()
-plt.xticks(rotation=45)
-plt.show()
-
-log("✅ Cell G Complete. Backtest finished.")
 log("Pipeline Complete.")
 
 # Calibration Footer (Required by Guidelines)
@@ -1588,10 +2840,11 @@ def create_network_frame(panel_df, deals_df, quarter, target_col, top_n=30, corr
     ax.set_title(f"Firm Correlation Network - {quarter}\nRed = M&A Event")
     ax.axis("off")
     
-    # Save to buffer
+    # Save to buffer (compatible with matplotlib 3.8+)
     fig.canvas.draw()
-    image = np.frombuffer(fig.canvas.tostring_rgb(), dtype="uint8")
-    image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    buf = fig.canvas.buffer_rgba()
+    image = np.asarray(buf, dtype="uint8")
+    image = image[:, :, :3]  # Convert RGBA to RGB
     plt.close(fig)
     
     return image
@@ -2201,6 +3454,26 @@ def run_calibrated_backtest(panel_df, target_col, feature_cols, artifact_dir):
     print("\n" + "="*60)
     print("CALIBRATED BACKTEST SUMMARY")
     print("="*60)
+
+# ================================================
+# RUNTIME VERIFICATION HARNESS (Section 10 of TODO.md)
+# ================================================
+try:
+    from src.verify.verify_performance import run_verification_harness, print_verification_summary
+    is_second_run = COMPILE_ARTIFACTS.cache_hit
+    verification_result = run_verification_harness(
+        timing_log=TIMING_LOGGER.rows,
+        compile_artifacts=COMPILE_ARTIFACTS,
+        is_second_run=is_second_run
+    )
+    print_verification_summary(verification_result)
+    verify_path = os.path.join(ARTIFACT_DIR, "verification_result.json")
+    with open(verify_path, "w") as f:
+        json.dump({"passed": verification_result.passed, "details": verification_result.details}, f, indent=2, default=str)
+    log(f"Verification result saved: {verify_path}")
+except Exception as e:
+    log(f"[WARN] Verification harness error: {e}")
+
     print(f"Mean AUC:               {results_df['auc'].mean():.3f}")
     print(f"Mean Port Return:       {results_df['port_ret'].mean():.2%}")
     print(f"Mean Excess/Universe:   {results_df['excess_vs_univ'].mean():.2%}")

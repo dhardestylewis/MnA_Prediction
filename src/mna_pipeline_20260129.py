@@ -917,21 +917,39 @@ def feature_engineering(df):
     return df
 
 # Run
-features_df = feature_engineering(panel_clean.copy())
-
-# Save
+# Run with Resume Logic
 feat_path = os.path.join(ARTIFACT_DIR, "features_panel.parquet")
-features_df.to_parquet(feat_path, index=False)
+feat_list_path = os.path.join(ARTIFACT_DIR, "feature_list.json")
 
-# Save feature list
-numeric_cols = features_df.select_dtypes(include=np.number).columns.tolist()
-exclude = {"gvkey", "cik", "year", "price_pit_risk_flag", "ret_fwd_1q"}
-final_feats = [c for c in numeric_cols if c not in exclude and not c.startswith("label")]
-
-with open(os.path.join(ARTIFACT_DIR, "feature_list.json"), "w") as f:
-    json.dump(final_feats, f)
-
-log(f"✅ Cell D Complete. Saved features to {feat_path}")
+if AUTO_RESUME and os.path.exists(feat_path) and os.path.exists(feat_list_path):
+    log(f"♻️ RESUMING: Found existing features panel at {feat_path}")
+    try:
+        features_df = pd.read_parquet(feat_path)
+        with open(feat_list_path, "r") as f:
+            final_feats = json.load(f)
+    except Exception as e:
+        log(f"[WARN] Failed to load resume artifacts for Cell D: {e}. Re-running...")
+        features_df = feature_engineering(panel_clean.copy())
+        features_df.to_parquet(feat_path, index=False)
+        numeric_cols = features_df.select_dtypes(include=np.number).columns.tolist()
+        exclude = {"gvkey", "cik", "year", "price_pit_risk_flag", "ret_fwd_1q"}
+        final_feats = [c for c in numeric_cols if c not in exclude and not c.startswith("label")]
+        with open(feat_list_path, "w") as f:
+            json.dump(final_feats, f)
+        log(f"✅ Cell D Complete. Saved features to {feat_path}")
+else:
+    features_df = feature_engineering(panel_clean.copy())
+    features_df.to_parquet(feat_path, index=False)
+    
+    # Save feature list
+    numeric_cols = features_df.select_dtypes(include=np.number).columns.tolist()
+    exclude = {"gvkey", "cik", "year", "price_pit_risk_flag", "ret_fwd_1q"}
+    final_feats = [c for c in numeric_cols if c not in exclude and not c.startswith("label")]
+    
+    with open(feat_list_path, "w") as f:
+        json.dump(final_feats, f)
+    
+    log(f"✅ Cell D Complete. Saved features to {feat_path}")
 
 # %% [markdown]
 # # Cell E: Multi-Horizon Labeling (Vectorized)
@@ -992,18 +1010,27 @@ def label_panel_multi_horizon(panel_df, deals_df, horizons_months):
     return panel
 
 # Run
-labeled_panel = label_panel_multi_horizon(features_df, deals_df, CONFIG["horizons_months"])
-
-# Save
+# Run with Resume Logic
 label_path = os.path.join(ARTIFACT_DIR, "labeled_panel.parquet")
-labeled_panel.to_parquet(label_path, index=False)
-
-# Coverage Report
-cov_report = labeled_panel.groupby("year")[[f"label_deal_0_{m}m" for m in CONFIG["horizons_months"]]].sum()
 cov_path = os.path.join(ARTIFACT_DIR, "label_coverage.csv")
-cov_report.to_csv(cov_path)
 
-log(f"✅ Cell E Complete. Saved labeled panel to {label_path}")
+if AUTO_RESUME and os.path.exists(label_path):
+    log(f"♻️ RESUMING: Found existing labeled panel at {label_path}")
+    labeled_panel = pd.read_parquet(label_path)
+    if os.path.exists(cov_path):
+        cov_report = pd.read_csv(cov_path, index_col=0)
+    else:
+        # Re-compute Coverage Report
+        cov_report = labeled_panel.groupby("year")[[f"label_deal_0_{m}m" for m in CONFIG["horizons_months"]]].sum()
+else:
+    labeled_panel = label_panel_multi_horizon(features_df, deals_df, CONFIG["horizons_months"])
+    labeled_panel.to_parquet(label_path, index=False)
+    
+    # Coverage Report
+    cov_report = labeled_panel.groupby("year")[[f"label_deal_0_{m}m" for m in CONFIG["horizons_months"]]].sum()
+    cov_report.to_csv(cov_path)
+    
+    log(f"✅ Cell E Complete. Saved labeled panel to {label_path}")
 print("\nLabel Coverage by Year:")
 print(cov_report.tail(5))
 
@@ -1095,16 +1122,22 @@ def dry_run_harness(df, target_col, n_trials=5, top_k=50):
     return pd.DataFrame(results), mean_jaccard
 
 # Prepare quarter column
+# Prepare quarter column - Always do this, needed for Cell G too
 labeled_panel["panel_q"] = labeled_panel["datadate"].dt.to_period("Q")
 
-# Run Dry Run
-dry_res, stability_score = dry_run_harness(labeled_panel, "label_deal_0_3m", n_trials=CONFIG["calibration"]["n_dryrun_trials"])
-
-# Save
+# Run Dry Run with Resume Logic
 dry_path = os.path.join(ARTIFACT_DIR, "dry_run_results.json")
-with open(dry_path, "w") as f:
-    json.dump(dry_res.to_dict('records'), f, indent=4) # Convert DataFrame to list of dicts for JSON saving
-log(f"✅ Cell F Complete. Stability Score: {stability_score:.2f}")
+
+if AUTO_RESUME and os.path.exists(dry_path):
+    log(f"♻️ RESUMING: Found existing dry run results at {dry_path}")
+    with open(dry_path, "r") as f:
+         dry_res = pd.DataFrame(json.load(f))
+    stability_score = 0.0 # Placeholder
+else:
+    dry_res, stability_score = dry_run_harness(labeled_panel, "label_deal_0_3m", n_trials=CONFIG["calibration"]["n_dryrun_trials"])
+    with open(dry_path, "w") as f:
+        json.dump(dry_res.to_dict('records'), f, indent=4) # Convert DataFrame to list of dicts for JSON saving
+    log(f"✅ Cell F Complete. Stability Score: {stability_score:.2f}")
 
 # %% [markdown]
 # # Cell G: Full Backtest & Baselines + Visuals

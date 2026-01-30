@@ -1116,14 +1116,8 @@ log(f"✅ Cell F Complete. Stability Score: {stability_score:.2f}")
 TARGET_HORIZON = "label_deal_0_3m"
 
 # 2. S&P 500 Baseline (yfinance)
-
-# Ensure panel_q exists in features_df for Backtest Loop
-if "panel_q" not in features_df.columns:
-    features_df["datadate"] = pd.to_datetime(features_df["datadate"])
-    features_df["panel_q"] = features_df["datadate"].dt.to_period("Q")
-
 log("Fetching S&P 500 (SPY) data...")
-start_date = features_df["datadate"].min().strftime("%Y-%m-%d")
+start_date = labeled_panel["datadate"].min().strftime("%Y-%m-%d")
 end_date = datetime.now().strftime("%Y-%m-%d")
 
 try:
@@ -1139,11 +1133,11 @@ except Exception as e:
     spy_map = {}
 
 # 3. Expanding Window Loop
-quarters = sorted(features_df["panel_q"].unique())
+quarters = sorted(labeled_panel["panel_q"].unique())
 start_idx = 10 # Burn-in
 results_backtest = []
 
-X_cols = [c for c in features_df.columns if c in final_feats]
+X_cols = [c for c in labeled_panel.columns if c in final_feats]
 
 log(f"Starting Backtest over {len(quarters)-start_idx} quarters...")
 
@@ -1151,11 +1145,11 @@ for q_idx in range(start_idx, len(quarters)):
     q = quarters[q_idx]
     
     # Train window: < q
-    train_mask = features_df["panel_q"] < q
-    test_mask = features_df["panel_q"] == q
+    train_mask = labeled_panel["panel_q"] < q
+    test_mask = labeled_panel["panel_q"] == q
     
-    train = features_df[train_mask]
-    test = features_df[test_mask]
+    train = labeled_panel[train_mask]
+    test = labeled_panel[test_mask]
     
     if len(test) == 0: continue
     if train[TARGET_HORIZON].sum() < 10: continue # Skip if no training signal

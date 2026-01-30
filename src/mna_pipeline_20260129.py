@@ -571,7 +571,15 @@ log(f"✅ Cell B Complete. Panel has {len(panel_clean)} rows.")
 # %%
 import csv
 
-def load_deals_robust(config, preloaded_df=None, tic_map=None):
+def load_deals_robust(config, preloaded_df=None, tic_map=None, name_map=None):
+    """
+    Robust deals loading with:
+    1. Preloaded DF support (Cell A2).
+    2. Ticker Mapping validation (FactSet rescue).
+    3. Name Mapping validation (FactSet rescue fallback).
+    4. Numeric CIK enforcement.
+    5. Duplicate column prevention.
+    """
     if preloaded_df is not None and not preloaded_df.empty:
         log(f"Using preloaded deals dataframe ({len(preloaded_df)} rows)...")
         df = preloaded_df.copy()
@@ -668,6 +676,32 @@ def load_deals_robust(config, preloaded_df=None, tic_map=None):
         else:
             log(f"[WARN] No Ticker column found in FactSet data. Available cols: {list(df.columns)}")
 
+    # --- Name Mapping (Fallback) ---
+    if name_map is not None:
+         mask_missing = df["cik"].isna()
+         if mask_missing.sum() > 0:
+             # Find target name column
+             name_col = None
+             for cand in ["target", "targetname", "target_name", "conm"]:
+                 if cand in df.columns:
+                     name_col = cand
+                     break
+             
+             if name_col:
+                 log(f"Attempting Name Map on {mask_missing.sum()} missing CIKs using col '{name_col}'...")
+                 # Normalize target name
+                 # clean: lower, remove punctuation, remove common legal suffixes
+                 s = df.loc[mask_missing, name_col].astype(str).str.lower()
+                 s = s.str.replace(r"[^\w\s]", "", regex=True) # remove punctuation
+                 s = s.str.replace(r"\b(inc|corp|ltd|llc|co|plc|nv|sa|ag)\b", "", regex=True) # remove suffixes
+                 s = s.str.strip()
+                 
+                 found_ciks = s.map(name_map)
+                 df.loc[mask_missing, "cik"] = found_ciks
+                 
+                 filled = found_ciks.notna().sum()
+                 log(f"  Name Map Filled {filled} CIKs.")
+
     # --- Common Cleanup ---
     if "cik" in df.columns:
         df["cik"] = pd.to_numeric(df["cik"], errors="coerce").astype("Int64")
@@ -715,17 +749,30 @@ def load_deals_robust(config, preloaded_df=None, tic_map=None):
 # Build Ticker -> CIK map from Compustat (panel_clean)
 # This allows us to link FactSet deals (which have Tickers) to CIKs
 TIC_MAP = {}
+NAME_MAP = {}
 if "tic" in panel_clean.columns and "cik" in panel_clean.columns:
-    # Drop rows without Ticker or CIK
+    # 1. Ticker Map
     valid_map = panel_clean[["tic", "cik"]].dropna()
-    # Normalize ticker (upper)
     valid_map["tic"] = valid_map["tic"].astype(str).str.upper().str.strip()
     valid_map["cik"] = valid_map["cik"].astype("Int64")
     # multiple tickers might map to same CIK, just take last observed
     TIC_MAP = valid_map.set_index("tic")["cik"].to_dict()
-    log(f"Generated Ticker-CIK map with {len(TIC_MAP)} entries.")
+    
+    # 2. Name Map (conm)
+    if "conm" in panel_clean.columns:
+         valid_name = panel_clean[["conm", "cik"]].dropna()
+         s = valid_name["conm"].astype(str).str.lower()
+         s = s.str.replace(r"[^\w\s]", "", regex=True)
+         s = s.str.replace(r"\b(inc|corp|ltd|llc|co|plc|nv|sa|ag)\b", "", regex=True)
+         s = s.str.strip()
+         valid_name["norm_name"] = s
+         valid_name["cik"] = valid_name["cik"].astype("Int64")
+         NAME_MAP = valid_name.set_index("norm_name")["cik"].to_dict()
 
-deals_df = load_deals_robust(CONFIG, preloaded_df=DEALS_DF, tic_map=TIC_MAP)
+    log(f"Generated Ticker-CIK map with {len(TIC_MAP)} entries.")
+    log(f"Generated Name-CIK map with {len(NAME_MAP)} entries.")
+
+ deals_df = load_deals_robust(CONFIG, preloaded_df=DEALS_DF, tic_map=TIC_MAP, name_map=NAME_MAP)
 
 # Save
 deals_path = os.path.join(ARTIFACT_DIR, "deals.parquet")
@@ -749,6 +796,11 @@ if not deals_df.empty and "ann_date" in deals_df.columns:
 # **Goal**: Create financial ratios, growth rates, and return features using vectorized operations.
 
 # %%
+log("Starting Vectorized Feature Engineering (CPU Optimized)...")
+
+# Sort for vectorized ops
+panel_clean = panel_clean.sort_values(["cik", "datadate"])
+
 from tqdm.auto import tqdm
 
 def feature_engineering(df):
@@ -1064,6 +1116,12 @@ log(f"✅ Cell F Complete. Stability Score: {stability_score:.2f}")
 TARGET_HORIZON = "label_deal_0_3m"
 
 # 2. S&P 500 Baseline (yfinance)
+
+# Ensure panel_q exists in features_df for Backtest Loop
+if "panel_q" not in features_df.columns:
+    features_df["datadate"] = pd.to_datetime(features_df["datadate"])
+    features_df["panel_q"] = features_df["datadate"].dt.to_period("Q")
+
 log("Fetching S&P 500 (SPY) data...")
 start_date = features_df["datadate"].min().strftime("%Y-%m-%d")
 end_date = datetime.now().strftime("%Y-%m-%d")

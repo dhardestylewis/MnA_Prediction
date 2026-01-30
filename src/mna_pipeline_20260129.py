@@ -772,7 +772,7 @@ if "tic" in panel_clean.columns and "cik" in panel_clean.columns:
     log(f"Generated Ticker-CIK map with {len(TIC_MAP)} entries.")
     log(f"Generated Name-CIK map with {len(NAME_MAP)} entries.")
 
- deals_df = load_deals_robust(CONFIG, preloaded_df=DEALS_DF, tic_map=TIC_MAP, name_map=NAME_MAP)
+deals_df = load_deals_robust(CONFIG, preloaded_df=DEALS_DF, tic_map=TIC_MAP, name_map=NAME_MAP)
 
 # Save
 deals_path = os.path.join(ARTIFACT_DIR, "deals.parquet")
